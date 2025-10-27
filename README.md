@@ -8,3 +8,7 @@ MSMP_QQBot-插件仓库
 - 区块备份、删除、还原插件[chunk_deleter](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/chunk_deleter)
 
 - 玩家上线坐标管理插件[player_coordinate_manager](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/player_coordinate_manager)
+
+## 插件开发
+
+[MSMP_QQBot-插件开发者文档](https://github.com/intellectmind/MSMP_QQBot/wiki/MSMP_QQBot-插件开发者文档)
