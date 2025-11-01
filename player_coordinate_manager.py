@@ -4,6 +4,7 @@
 功能:
 - 获取玩家上线坐标
 - 修改玩家上线坐标
+- 支持维度信息查询和修改
 """
 import os
 import logging
@@ -41,7 +42,7 @@ class PlayerDataModifier:
             if os.path.exists(dat_old_file):
                 dat_files.append(dat_old_file)
             
-            # 如果输入包含连字符(可能是UUID格式但没有)，尝试添加
+            # 如果输入包含连字符(可能是UUID格式但没有)，尝试添加 
             if len(player_identifier) == 32 and '-' not in player_identifier:
                 uuid_with_dash = f"{player_identifier[:8]}-{player_identifier[8:12]}-{player_identifier[12:16]}-{player_identifier[16:20]}-{player_identifier[20:]}"
                 dat_file = os.path.join(self.playerdata_path, f"{uuid_with_dash}.dat")
@@ -89,7 +90,7 @@ class PlayerDataModifier:
             self.logger.error(f"查找玩家 dat 文件失败: {e}")
             return []
     
-    def get_player_pos(self, player_identifier: str) -> Optional[Tuple[float, float, float]]:
+    def get_player_pos(self, player_identifier: str) -> Optional[Tuple[float, float, float, str]]:
         """获取玩家坐标（从 .dat 文件）"""
         try:
             dat_files = self._find_player_dat_files(player_identifier)
@@ -111,23 +112,34 @@ class PlayerDataModifier:
             
             nbt_file = nbtlib.load(dat_file)
             
+            # 获取坐标
+            coords = None
             if 'Pos' in nbt_file:
                 pos = nbt_file['Pos']
                 x = float(pos[0])
                 y = float(pos[1])
                 z = float(pos[2])
-                
-                self.logger.info(f"玩家 {player_identifier} 当前坐标: ({x}, {y}, {z})")
-                return (x, y, z)
+                coords = (x, y, z)
             else:
                 self.logger.warning(f"玩家 NBT 数据中不存在 Pos 标签")
                 return None
+            
+            # 获取维度
+            dimension = "minecraft:overworld"  # 默认值
+            if 'Dimension' in nbt_file:
+                dimension = str(nbt_file['Dimension'])
+                self.logger.info(f"玩家 {player_identifier} 当前维度: {dimension}")
+            
+            x, y, z = coords
+            self.logger.info(f"玩家 {player_identifier} 当前坐标: ({x}, {y}, {z}), 维度: {dimension}")
+            return (x, y, z, dimension)
             
         except Exception as e:
             self.logger.error(f"读取玩家坐标失败: {e}", exc_info=True)
             return None
     
-    def set_player_pos(self, player_identifier: str, x: float, y: float, z: float) -> bool:
+    def set_player_pos(self, player_identifier: str, x: float, y: float, z: float, 
+                      dimension: str = "minecraft:overworld") -> bool:
         """设置玩家坐标（同时修改 .dat 和 .dat_old 文件）"""
         try:
             if not (-30000000 <= x <= 30000000 and -64 <= y <= 320 and -30000000 <= z <= 30000000):
@@ -146,18 +158,21 @@ class PlayerDataModifier:
                 try:
                     nbt_file = nbtlib.load(dat_file_path)
                     
+                    # 修改坐标
                     if 'Pos' in nbt_file:
                         nbt_file['Pos'] = nbtlib.tag.List[nbtlib.tag.Double]([
                             nbtlib.tag.Double(x),
                             nbtlib.tag.Double(y),
                             nbtlib.tag.Double(z)
                         ])
-                        
-                        nbt_file.save()
-                        success_count += 1
-                        self.logger.info(f"已成功修改文件 {os.path.basename(dat_file_path)} 的坐标: ({x}, {y}, {z})")
-                    else:
-                        self.logger.warning(f"文件 {os.path.basename(dat_file_path)} 中不存在 Pos 标签")
+                    
+                    # 修改维度
+                    if dimension:
+                        nbt_file['Dimension'] = nbtlib.tag.String(dimension)
+                    
+                    nbt_file.save()
+                    success_count += 1
+                    self.logger.info(f"已成功修改文件 {os.path.basename(dat_file_path)} 的坐标: ({x}, {y}, {z}), 维度: {dimension}")
                         
                 except Exception as e:
                     self.logger.error(f"修改文件 {os.path.basename(dat_file_path)} 失败: {e}")
@@ -178,21 +193,21 @@ class PlayerCoordinatesPlugin(BotPlugin):
     """玩家坐标管理插件"""
     
     name = "玩家上线坐标管理"
-    version = "1.1.0"
+    version = "1.2.0"
     author = "MSMP_QQBot"
-    description = "提供玩家上线坐标查询和修改功能"
+    description = "提供玩家上线坐标查询和修改功能，支持维度信息"
     
     COMMANDS_HELP = {
         "getpos": {
             "names": ["getpos", "查询坐标", "查看坐标"],
-            "description": "查询玩家的坐标信息",
+            "description": "查询玩家的坐标信息和当前维度",
             "usage": "getpos <玩家名>",
             "admin_only": False,
         },
         "setpos": {
             "names": ["setpos", "设置坐标", "修改坐标"],
-            "description": "修改玩家的坐标（需要玩家离线）",
-            "usage": "setpos <玩家名> <x> <y> <z>",
+            "description": "修改玩家的坐标和维度（需要玩家离线）",
+            "usage": "setpos <玩家名> <x> <y> <z> [维度]",
             "admin_only": True,
         }
     }
@@ -303,7 +318,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
         working_dir = self._get_working_directory(config_manager)
         
         if not working_dir:
-            self.logger.error("无法确定服务器工作目录")
+            self.logger.error("无法确实服务器工作目录")
             return
         
         self.logger.info(f"使用工作目录: {working_dir}")
@@ -375,18 +390,29 @@ class PlayerCoordinatesPlugin(BotPlugin):
                 return "用法: getpos <玩家名>"
             
             player_name = parts[0]
-            coords = self.modifier.get_player_pos(player_name)
+            result = self.modifier.get_player_pos(player_name)
             
-            if coords:
-                x, y, z = coords
+            if result:
+                x, y, z, dimension = result
+                
+                # 维度显示名称映射
+                dimension_display = {
+                    "minecraft:overworld": "主世界",
+                    "minecraft:nether": "地狱",
+                    "minecraft:the_end": "末地"
+                }
+                
+                dimension_name = dimension_display.get(dimension, dimension)
+                
                 return (
                     f"玩家坐标信息\n"
-                    f"{'─' * 20}\n"
+                    f"{'─' * 10}\n"
                     f"玩家: {player_name}\n"
                     f"X坐标: {x:.2f}\n"
                     f"Y坐标: {y:.2f}\n"
                     f"Z坐标: {z:.2f}\n"
-                    f"{'─' * 20}"
+                    f"维度: {dimension_name} ({dimension})\n"
+                    f"{'─' * 10}"
                 )
             else:
                 return f"无法找到玩家 {player_name} 的数据"
@@ -412,7 +438,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
             parts = command_text.strip().split()
             
             if len(parts) < 4:
-                return "用法: setpos <玩家名> <x> <y> <z>"
+                return "用法: setpos <玩家名> <x> <y> <z> [维度]"
             
             player_name = parts[0]
             
@@ -422,6 +448,11 @@ class PlayerCoordinatesPlugin(BotPlugin):
                 z = float(parts[3])
             except ValueError:
                 return "错误: 坐标必须是数字!"
+            
+            # 获取维度，默认为主世界
+            dimension = "minecraft:overworld"
+            if len(parts) > 4:
+                dimension = parts[4]
             
             if not (-30000000 <= x <= 30000000 and -64 <= y <= 320 and -30000000 <= z <= 30000000):
                 return (
@@ -438,16 +469,26 @@ class PlayerCoordinatesPlugin(BotPlugin):
             else:
                 self.logger.warning(f"无法踢出玩家或玩家未在线: {player_name}")
             
-            # 修改坐标
-            success = self.modifier.set_player_pos(player_name, x, y, z)
+            # 修改坐标和维度
+            success = self.modifier.set_player_pos(player_name, x, y, z, dimension)
+            
+            # 维度显示名称映射
+            dimension_display = {
+                "minecraft:overworld": "主世界",
+                "minecraft:nether": "地狱",
+                "minecraft:the_end": "末地"
+            }
+            
+            dimension_name = dimension_display.get(dimension, dimension)
             
             if success:
                 return (
                     f"成功修改玩家坐标!\n"
-                    f"{'─' * 22}\n"
+                    f"{'─' * 10}\n"
                     f"玩家: {player_name}\n"
                     f"新坐标: ({x:.0f}, {y:.0f}, {z:.0f})\n"
-                    f"{'─' * 22}\n"
+                    f"维度: {dimension_name} ({dimension})\n"
+                    f"{'─' * 10}\n"
                     f"已同时更新 .dat 和 .dat_old 文件\n"
                     f"玩家下次登录时将在新位置出现"
                 )
