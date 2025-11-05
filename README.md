@@ -14,7 +14,7 @@ MSMP_QQBot-插件仓库
 配置说明：
 ```json
 {
-  // AI API 配置
+  // AI API 配置 （openai兼容协议的都可）
   "ai_api_url": "",  // AI API 的接口地址
   "ai_api_key": "",  // AI API 的访问密钥
   "ai_model": "",  // 使用的 AI 模型名称
