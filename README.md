@@ -9,7 +9,8 @@ MSMP_QQBot-插件仓库
 
 - 玩家上线坐标管理插件[player_coordinate_manager](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/player_coordinate_manager)
 
-- AI白名单审核（自动出题+审题）[player_coordinate_manager](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/whitelist_audit)
+- AI白名单审核（自动出题+审题）[whitelist_audit](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/whitelist_audit)
+
 配置说明：
 ```json
 {
