@@ -15,9 +15,9 @@ MSMP_QQBot-插件仓库
 ```json
 {
   // AI API 配置 （openai兼容协议的都可）
-  "ai_api_url": "",  // AI API 的接口地址
-  "ai_api_key": "",  // AI API 的访问密钥
-  "ai_model": "",  // 使用的 AI 模型名称
+  "ai_api_url": "https://api.XXX.com/v1",  // AI API 的接口地址
+  "ai_api_key": "sk-6jrlPahMxA...",  // AI API 的访问密钥
+  "ai_model": "deepseek-v3.2-exp",  // 使用的 AI 模型名称
   
   // 群组权限配置
   "allowed_groups": [
