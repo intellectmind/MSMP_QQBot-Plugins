@@ -184,16 +184,12 @@ class QQMCBindingPlugin(BotPlugin):
             # 使用插件管理器提供的API检查服务器状态
             if hasattr(self.plugin_manager, 'is_server_running'):
                 self._server_running = self.plugin_manager.is_server_running()
-                self.logger.info(f"检测到服务器运行状态: {self._server_running}")
             else:
                 # 如果API不可用，记录警告但继续运行
-                self.logger.warning("is_server_running API不可用，假设服务器在运行")
                 self._server_running = True
                 
         except Exception as e:
             self.logger.error(f"检查服务器状态失败: {e}")
-            # 出错时默认设置为运行状态，避免影响功能
-            self._server_running = True
 
     async def on_server_started(self, *args, **kwargs):
         """服务器启动事件"""
