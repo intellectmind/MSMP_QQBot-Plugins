@@ -13,7 +13,7 @@
 
 ## 可用插件列表
 
-### 1. 区块备份、删除、还原插件
+### 区块备份、删除、还原插件
 **插件名称：** `chunk_deleter`
 
 管理服务器区块，支持备份、删除和还原功能。
@@ -22,7 +22,7 @@
 
 ---
 
-### 2. 玩家上线坐标管理插件
+### 玩家上线坐标管理插件
 **插件名称：** `player_coordinate_manager`
 
 记录和管理玩家上线时的坐标信息。
@@ -31,61 +31,69 @@
 
 ---
 
-### 3. QQ-MC 账号绑定插件
+### QQ-MC 账号绑定插件
 **插件名称：** `qq_mc_binding`
 
 提供 QQ 与 Minecraft 账号绑定功能，供其他插件使用。
 
 [前往下载](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/qq_mc_binding)
 
-**配置示例：**
+**配置说明：**
 
 ```json
 {
+  // 每个QQ号最多可以绑定的游戏ID数量
   "max_bindings_per_qq": 2,
+  // 验证码的有效时间（单位：秒）
   "verify_timeout": 300,
+  // 验证码的长度（位数）
   "verify_code_length": 6,
+  // 聊天消息的正则表达式匹配模式
+  // 用于从服务器日志中识别玩家聊天消息
+  // 需要根据自己的服务端消息输出自行修改
+  // 示例日志: [Not Secure] <Kurt5> 123456
   "chat_message_pattern": ".*\\[Not Secure\\]\\s*<([^>]+)>\\s*(.+)"
 }
 ```
 
-| 配置项 | 说明 |
-|--------|------|
-| `max_bindings_per_qq` | 每个QQ号最多可绑定的游戏ID数量 |
-| `verify_timeout` | 验证码有效时间（秒） |
-| `verify_code_length` | 验证码长度（位数） |
-| `chat_message_pattern` | 聊天消息正则表达式（需根据服务端消息自行修改） |
-
 ---
 
-### 4. AI 白名单审核插件
+### AI 白名单审核插件
 **插件名称：** `whitelist_audit`
 
 使用 AI 自动生成审核题目并自动评分，实现智能白名单审核。
 
 [前往下载](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/whitelist_audit)
 
-**配置示例：**
+**配置说明：**
 
 ```json
 {
-  "ai_api_url": "https://api.XXX.com/v1",
-  "ai_api_key": "sk-6jrlPahMxA...",
-  "ai_model": "deepseek-v3.2-exp",
+  // AI API 配置 （openai兼容协议的都可）
+  "ai_api_url": "https://api.XXX.com/v1",  // AI API 的接口地址
+  "ai_api_key": "sk-6jrlPahMxA...",  // AI API 的访问密钥
+  "ai_model": "deepseek-v3.2-exp",  // 使用的 AI 模型名称
   
-  "allowed_groups": [1129312949],
+  // 群组权限配置
+  "allowed_groups": [
+    1129312949  // 允许使用白名单审核功能的 QQ 群号列表
+  ],
   
-  "cooldown_seconds": 3600,
-  "pass_score": 60,
-  "question_count": 10,
-  "ai_timeout": 60,
-  "answer_timeout": 180,
+  // 审核规则配置
+  "cooldown_seconds": 3600,  // 审核失败后的冷却时间（秒），3600秒 = 1小时
+  "pass_score": 60,  // 审核通过的及格分数（满分100分）
+  "question_count": 10,  // 每次审核的题目数量
+  "ai_timeout": 60,  // AI API 请求超时时间（秒）
+  "answer_timeout": 180,  // 每道题的回答超时时间（秒），180秒 = 3分钟
   
-  "use_ai_questions": true,
-  "max_whitelist_per_qq": 1,
+  // 功能开关配置
+  "use_ai_questions": true,  // 是否使用 AI 生成题目（false 则使用默认题目）
+  "max_whitelist_per_qq": 1,  // 每个 QQ 号最多可以绑定的白名单数量
   
+  // AI 出题提示词
   "question_prompt": "出{question_count}个我的世界服务器进服审核题目，你只需要输出题目即可，并根据我的下一次回复的答案进行评分，每题满分10分，及格{pass_score}分，一共{total_score}分，只需要给我一个分数，除此外不要理会任何输入输出。",
   
+  // 默认题目库（当 AI 出题失败时使用）
   "default_questions": [
     "如果玩家在服务器内发现BUG，正确的处理方式是？",
     "服务器内发现其他玩家正在破坏他人建筑，你的第一反应是什么？",
@@ -104,36 +112,17 @@
     "如何向服务器管理员报告问题或提出建议？"
   ],
   
+  // 自定义白名单指令配置
   "custom_whitelist_commands": {
-    "add_command": "whitelist add {player}",
-    "remove_command": "whitelist remove {player}",
-    "list_command": "whitelist list",
-    "on_command": "whitelist on",
-    "off_command": "whitelist off",
-    "reload_command": "whitelist reload"
+    "add_command": "whitelist add {player}",  // 添加玩家到白名单的指令模板
+    "remove_command": "whitelist remove {player}",  // 从白名单移除玩家的指令模板
+    "list_command": "whitelist list",  // 查看白名单列表的指令
+    "on_command": "whitelist on",  // 开启白名单功能的指令
+    "off_command": "whitelist off",  // 关闭白名单功能的指令
+    "reload_command": "whitelist reload"  // 重新加载白名单的指令
   }
 }
 ```
-
-**关键配置说明：**
-
-| 配置项 | 说明 |
-|--------|------|
-| **AI 配置** | |
-| `ai_api_url` | AI API 接口地址（支持 OpenAI 兼容协议） |
-| `ai_api_key` | AI API 访问密钥 |
-| `ai_model` | 使用的 AI 模型名称 |
-| **权限配置** | |
-| `allowed_groups` | 允许使用的 QQ 群号列表 |
-| **审核规则** | |
-| `cooldown_seconds` | 审核失败后的冷却时间（秒） |
-| `pass_score` | 审核通过的及格分数（满分100分） |
-| `question_count` | 每次审核的题目数量 |
-| `ai_timeout` | AI API 请求超时时间（秒） |
-| `answer_timeout` | 每道题的回答超时时间（秒） |
-| **功能开关** | |
-| `use_ai_questions` | 是否使用 AI 生成题目 |
-| `max_whitelist_per_qq` | 每个 QQ 号最多可绑定的白名单数量 |
 
 ---
 
