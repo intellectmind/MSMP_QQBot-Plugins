@@ -1,7 +1,9 @@
 # MSMP_QQBot--Plugins
 MSMP_QQBot-插件仓库
 
-下载插件后直接放入plugins文件夹即可
+下载插件后直接放入plugins文件夹，或在plugins文件夹内自己新建文件夹放入。以下两种方式都可以
+- plugins/my_plugin.py - 单文件插件
+- plugins/my_plugin/my_plugin.py - 文件夹插件
 
 ## 插件列表：
 
