@@ -61,7 +61,9 @@
 ### MC-QQ消息同步插件
 **插件名称：** `mc_qq_sync`
 
-实现MC玩家消息与QQ群内消息的双向同步。依赖QQ-MC 账号绑定插件，玩家消息匹配正则依赖使用`plugins\qq_mc_binding\config.json`的`chat_message_pattern`的配置
+实现MC玩家消息与QQ群内消息的双向同步。
+
+依赖QQ-MC 账号绑定插件，玩家消息匹配正则依赖使用`plugins\qq_mc_binding\config.json`的`chat_message_pattern`的配置。
 
 [前往下载](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/mc_qq_sync)
 
