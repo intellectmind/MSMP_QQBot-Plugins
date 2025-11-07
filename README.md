@@ -9,9 +9,24 @@ MSMP_QQBot-插件仓库
 
 - 玩家上线坐标管理插件[player_coordinate_manager](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/player_coordinate_manager)
 
-- AI白名单审核（自动出题+审题）[whitelist_audit](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/whitelist_audit)
+- QQ-MC 账号绑定（供其他插件使用）[qq_mc_binding](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/qq_mc_binding)
+```json
+{
+  // 每个QQ号最多可以绑定的游戏ID数量
+  "max_bindings_per_qq": 2,
+  // 验证码的有效时间（单位：秒）
+  "verify_timeout": 300,
+  // 验证码的长度（位数）
+  "verify_code_length": 6,
+  // 聊天消息的正则表达式匹配模式
+  // 用于从服务器日志中识别玩家聊天消息
+  // 需要根据自己的服务端消息输出自行修改
+  // 示例日志: [Not Secure] <Kurt5> 123456
+  "chat_message_pattern": ".*\\[Not Secure\\]\\s*<([^>]+)>\\s*(.+)"
+}
+```
 
-配置说明：
+- AI白名单审核（自动出题+审题）[whitelist_audit](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/whitelist_audit)
 ```json
 {
   // AI API 配置 （openai兼容协议的都可）
