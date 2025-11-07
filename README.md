@@ -58,6 +58,68 @@
 
 ---
 
+### MC-QQ消息同步插件
+**插件名称：** `mc_qq_sync`
+
+实现MC玩家消息与QQ群内消息的双向同步。依赖QQ-MC 账号绑定插件，玩家消息匹配正则依赖使用`plugins\qq_mc_binding\config.json`的`chat_message_pattern`的配置
+
+[前往下载](https://github.com/intellectmind/MSMP_QQBot-Plugins/releases/tag/mc_qq_sync)
+
+**配置说明：**
+
+```json
+{
+  "features": {
+    // MC玩家自动同步到QQ群
+    "mc_auto_sync_to_qq": {
+      "enabled": true,
+      "group_ids": [
+        123456789
+      ]
+    },
+    // MC玩家主动发送消息到QQ群（使用qq命令）
+    "mc_manual_sync_to_qq": {
+      "enabled": true,
+      "group_ids": [
+        123456789
+      ]
+    },
+    // QQ群用户通过命令发送消息到MC（使用mc命令）
+    "qq_manual_to_mc": {
+      "enabled": true,
+      "group_ids": [
+        123456789
+      ]
+    }
+  },
+  "message_format": {
+    // MC自动同步消息格式
+    "mc_auto_to_qq": "[MC] {player}: {message}",
+    // MC主动发送消息格式
+    "mc_manual_to_qq": "[MC] {player}: {message}",
+    // QQ用户命令消息格式
+    "qq_manual_to_mc": "[QQ] {nickname}: {message}"
+  },
+  // QQ发送到MC的命令前缀
+  "qq_commands": {
+    "mc_command_prefix": "mc"
+  },
+  // MC发送到QQ的命令前缀
+  "mc_commands": {
+    "qq_command_prefix": "qq"
+  },
+  // 黑名单
+  "blacklist": {
+    // 被屏蔽的玩家
+    "players": [],
+    // 被屏蔽的QQ用户
+    "users": []
+  }
+}
+```
+
+---
+
 ### AI 白名单审核插件
 **插件名称：** `whitelist_audit`
 
