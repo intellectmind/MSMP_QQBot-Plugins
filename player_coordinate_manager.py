@@ -8,9 +8,15 @@
 """
 import os
 import logging
-import nbtlib
+import asyncio
 from typing import Optional, Tuple, List, Dict, Any
 from plugin_manager import BotPlugin
+
+try:
+    import nbtlib
+except ImportError:
+    nbtlib = None
+
 
 class PlayerDataModifier:
     """玩家数据修改器"""
@@ -93,6 +99,10 @@ class PlayerDataModifier:
     def get_player_pos(self, player_identifier: str) -> Optional[Tuple[float, float, float, str]]:
         """获取玩家坐标（从 .dat 文件）"""
         try:
+            if nbtlib is None:
+                self.logger.error("nbtlib 未安装，无法读取玩家 NBT 数据")
+                return None
+
             dat_files = self._find_player_dat_files(player_identifier)
             
             # 优先使用 .dat 文件
@@ -142,6 +152,10 @@ class PlayerDataModifier:
                       dimension: str = "minecraft:overworld") -> bool:
         """设置玩家坐标（同时修改 .dat 和 .dat_old 文件）"""
         try:
+            if nbtlib is None:
+                self.logger.error("nbtlib 未安装，无法修改玩家 NBT 数据")
+                return False
+
             if not (-30000000 <= x <= 30000000 and -64 <= y <= 320 and -30000000 <= z <= 30000000):
                 self.logger.error(f"坐标超出范围: ({x}, {y}, {z})")
                 return False
@@ -193,7 +207,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
     """玩家坐标管理插件"""
     
     name = "玩家上线坐标管理"
-    version = "1.2.0"
+    version = "2.0.0"
     author = "MSMP_QQBot"
     description = "提供玩家上线坐标查询和修改功能，支持维度信息"
     
@@ -216,8 +230,8 @@ class PlayerCoordinatesPlugin(BotPlugin):
         super().__init__(logger)
         self.plugin_manager = None
         self.config_manager = None
-        self.modifier = None
-        self.world_path = None
+        self.modifiers: Dict[str, PlayerDataModifier] = {}
+        self.world_paths: Dict[str, str] = {}
     
     async def on_load(self, plugin_manager: 'PluginManager') -> bool:
         """插件加载"""
@@ -239,7 +253,8 @@ class PlayerCoordinatesPlugin(BotPlugin):
     async def on_unload(self):
         """插件卸载"""
         self.logger.info(f"正在卸载 {self.name} 插件...")
-        self.modifier = None
+        self.modifiers.clear()
+        self.world_paths.clear()
         self.config_manager = None
     
     async def _register_commands(self):
@@ -265,7 +280,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
         
         self.logger.info("已注册所有命令")
     
-    def _get_working_directory(self, config_manager=None) -> str:
+    def _get_working_directory(self, config_manager=None, target_server=None) -> str:
         """获取服务器工作目录 - 使用 ConfigManager
         
         逻辑：
@@ -282,7 +297,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
                 return ""
             
             # 获取工作目录配置
-            working_dir = config_manager.get_server_working_directory()
+            working_dir = config_manager.get_server_working_directory(target_server)
             
             # 情况1: working_directory 非空且存在 → 直接使用
             if working_dir and os.path.exists(working_dir):
@@ -292,7 +307,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
             
             # 情况2: working_directory 为空 → 使用 start_script 所在目录
             if not working_dir:
-                start_script = config_manager.get_server_start_script()
+                start_script = config_manager.get_server_start_script(target_server)
                 
                 if start_script and os.path.exists(start_script):
                     working_dir = os.path.dirname(start_script)
@@ -309,34 +324,45 @@ class PlayerCoordinatesPlugin(BotPlugin):
             self.logger.error(f"获取工作目录异常: {e}", exc_info=True)
             return ""
     
-    def _init_modifier(self, config_manager=None):
+    def _init_modifier(self, config_manager=None, target_server=None) -> Optional[PlayerDataModifier]:
         """延迟初始化 modifier - 在命令执行时调用"""
-        if self.modifier:
-            return  # 已经初始化过了
-        
         # 获取工作目录
-        working_dir = self._get_working_directory(config_manager)
+        working_dir = self._get_working_directory(config_manager, target_server)
         
         if not working_dir:
             self.logger.error("无法确实服务器工作目录")
-            return
+            return None
         
         self.logger.info(f"使用工作目录: {working_dir}")
+        server_key = self._server_key(target_server, working_dir)
         
         # 检查是否是有效的世界目录
         if os.path.exists(os.path.join(working_dir, "playerdata")):
             # working_dir 本身就是世界目录
-            self.world_path = working_dir
-            self.modifier = PlayerDataModifier(working_dir, self.logger)
-            return
+            if self.world_paths.get(server_key) == working_dir and server_key in self.modifiers:
+                return self.modifiers[server_key]
+            self.world_paths[server_key] = working_dir
+            self.modifiers[server_key] = PlayerDataModifier(working_dir, self.logger)
+            return self.modifiers[server_key]
         elif os.path.exists(os.path.join(working_dir, "world", "playerdata")):
             # working_dir 包含 world 子目录
             world_path = os.path.join(working_dir, "world")
-            self.world_path = world_path
-            self.modifier = PlayerDataModifier(world_path, self.logger)
-            return
+            if self.world_paths.get(server_key) == world_path and server_key in self.modifiers:
+                return self.modifiers[server_key]
+            self.world_paths[server_key] = world_path
+            self.modifiers[server_key] = PlayerDataModifier(world_path, self.logger)
+            return self.modifiers[server_key]
         else:
             self.logger.error(f"在工作目录 {working_dir} 中找不到 playerdata 文件夹")
+            return None
+
+    def _server_key(self, target_server=None, working_dir: str = "") -> str:
+        return str(
+            (target_server or {}).get("_config_file") or
+            (target_server or {}).get("name") or
+            working_dir or
+            "default"
+        )
     
     def get_plugin_help(self) -> str:
         """获取插件帮助信息"""
@@ -377,10 +403,13 @@ class PlayerCoordinatesPlugin(BotPlugin):
     async def handle_getpos(self, user_id: int, group_id: int, command_text: str, 
                            config_manager=None, **kwargs) -> str:
         """处理 getpos 命令"""
+        if nbtlib is None:
+            return "玩家坐标插件缺少依赖 nbtlib，请先安装: python -m pip install nbtlib"
+
         # 延迟初始化，传入 config_manager
-        self._init_modifier(config_manager)
+        modifier = self._init_modifier(config_manager, kwargs.get('target_server'))
         
-        if not self.modifier:
+        if not modifier:
             return "玩家坐标插件未正确初始化，找不到 world/playerdata 目录。请检查服务器工作目录配置。"
         
         try:
@@ -390,7 +419,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
                 return "用法: getpos <玩家名>"
             
             player_name = parts[0]
-            result = self.modifier.get_player_pos(player_name)
+            result = modifier.get_player_pos(player_name)
             
             if result:
                 x, y, z, dimension = result
@@ -424,14 +453,17 @@ class PlayerCoordinatesPlugin(BotPlugin):
     async def handle_setpos(self, user_id: int, group_id: int, command_text: str,
                            config_manager=None, rcon_client=None, **kwargs) -> str:
         """处理 setpos 命令"""
+        if nbtlib is None:
+            return "玩家坐标插件缺少依赖 nbtlib，请先安装: python -m pip install nbtlib"
+
         # 延迟初始化，传入 config_manager
-        self._init_modifier(config_manager)
+        modifier = self._init_modifier(config_manager, kwargs.get('target_server'))
         
-        if not self.modifier:
+        if not modifier:
             return "玩家坐标插件未正确初始化，找不到 world/playerdata 目录。请检查服务器工作目录配置。"
         
         # 检查管理员权限
-        if config_manager and not config_manager.is_admin(user_id):
+        if config_manager and not config_manager.is_server_admin(user_id, kwargs.get('target_server')):
             return "权限不足：此命令仅限管理员使用"
         
         try:
@@ -470,7 +502,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
                 self.logger.warning(f"无法踢出玩家或玩家未在线: {player_name}")
             
             # 修改坐标和维度
-            success = self.modifier.set_player_pos(player_name, x, y, z, dimension)
+            success = modifier.set_player_pos(player_name, x, y, z, dimension)
             
             # 维度显示名称映射
             dimension_display = {
@@ -521,14 +553,22 @@ class PlayerCoordinatesPlugin(BotPlugin):
             if not rcon_client:
                 self.logger.debug("RCON 客户端不可用，跳过踢出玩家步骤")
                 return False
-            
-            if not rcon_client.is_connected():
-                self.logger.debug("RCON 连接不可用，跳过踢出玩家步骤")
-                return False
-            
+
             # 执行踢出命令
             kick_command = f"kick {player_name} 坐标已修改，请重新登录"
-            result = rcon_client.execute_command(kick_command)
+            if hasattr(rcon_client, "run_connected"):
+                connected, result = await asyncio.to_thread(
+                    rcon_client.run_connected,
+                    lambda client: client.execute_command(kick_command)
+                )
+                if not connected:
+                    self.logger.debug("RCON 连接不可用，跳过踢出玩家步骤")
+                    return False
+            else:
+                if not rcon_client.is_connected():
+                    self.logger.debug("RCON 连接不可用，跳过踢出玩家步骤")
+                    return False
+                result = await asyncio.to_thread(rcon_client.execute_command, kick_command)
             
             self.logger.info(f"已执行踢出命令: {kick_command}")
             self.logger.debug(f"踢出命令结果: {result}")
@@ -542,7 +582,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
     async def on_config_reload(self, old_config: dict, new_config: dict):
         """配置重新加载"""
         # 当配置重新加载时，重置 modifier 以便重新初始化
-        if self.modifier:
+        if self.modifiers:
             self.logger.info("配置已重新加载，重置玩家数据修改器")
-            self.modifier = None
-            self.world_path = None
+            self.modifiers.clear()
+            self.world_paths.clear()

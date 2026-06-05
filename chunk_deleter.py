@@ -11,7 +11,7 @@ class ChunkDeleterPlugin(BotPlugin):
     """区块备份、删除、还原插件"""
     
     name = "Chunk Deleter"
-    version = "1.0.0"
+    version = "2.0.0"
     author = "MSMP_QQBot"
     description = "提供区块备份、删除、还原功能"
     

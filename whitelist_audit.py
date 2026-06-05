@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import os
 import re
@@ -6,7 +7,6 @@ import time
 from datetime import datetime
 from typing import Optional, Dict, List
 from plugin_manager import BotPlugin
-import aiohttp
 
 try:
     from openai import AsyncOpenAI
@@ -18,7 +18,7 @@ class WhitelistAuditPlugin(BotPlugin):
     """白名单审核插件 - 通过AI生成题目进行玩家审核"""
     
     name = "Whitelist Audit"
-    version = "1.0.0"
+    version = "2.0.0"
     author = "MSMP_QQBot"
     description = "通过AI答题审核白名单申请，支持自定义白名单指令"
     
@@ -73,22 +73,23 @@ class WhitelistAuditPlugin(BotPlugin):
     
     def __init__(self, logger):
         super().__init__(logger)
-        self.config = self.DEFAULT_CONFIG.copy()
+        self.config = copy.deepcopy(self.DEFAULT_CONFIG)
         self.audit_records = {}
         self.whitelist = {}
         self.cooldown = {}
         self.audit_sessions = {}
         self.timeout_tasks = {}
+        self.cleanup_task = None
         self.plugin_manager = None
         self.auditing_game_ids = set()  # 正在审核的游戏ID集合
         
     async def on_load(self, plugin_manager):
         """加载插件"""
         try:
+            self.plugin_manager = plugin_manager
             self._ensure_data_dir()
             self._load_config()
             self._load_data()
-            self.plugin_manager = plugin_manager
             
             # 保存 QQBotServer 引用以便后续获取 RCON 客户端
             self.qq_bot_server = None
@@ -137,7 +138,8 @@ class WhitelistAuditPlugin(BotPlugin):
             )
             
             # 启动会话清理任务
-            asyncio.create_task(self._cleanup_expired_sessions())
+            if not self.cleanup_task or self.cleanup_task.done():
+                self.cleanup_task = asyncio.create_task(self._cleanup_expired_sessions())
             
             self.logger.info(f"{self.name} v{self.version} 已加载")
             return True
@@ -167,8 +169,9 @@ class WhitelistAuditPlugin(BotPlugin):
                     game_id = session.get("game_id")
                     
                     # 从正在审核集合中移除
-                    if game_id in self.auditing_game_ids:
-                        self.auditing_game_ids.remove(game_id)
+                    audit_key = self._audit_key(game_id, session.get("server_key", "default"))
+                    if audit_key in self.auditing_game_ids:
+                        self.auditing_game_ids.remove(audit_key)
                     
                     # 取消超时任务
                     if session_key in self.timeout_tasks:
@@ -188,10 +191,21 @@ class WhitelistAuditPlugin(BotPlugin):
 
     async def on_unload(self):
         """卸载插件"""
-        for task_key in list(self.timeout_tasks.keys()):
-            task = self.timeout_tasks[task_key]
+        if self.cleanup_task and not self.cleanup_task.done():
+            self.cleanup_task.cancel()
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
+        self.cleanup_task = None
+        timeout_tasks = list(self.timeout_tasks.values())
+        for task in timeout_tasks:
             if not task.done():
                 task.cancel()
+        if timeout_tasks:
+            await asyncio.gather(*timeout_tasks, return_exceptions=True)
+        self.timeout_tasks.clear()
+        self.audit_sessions.clear()
         self._save_data()
         self.auditing_game_ids.clear()
         self.logger.info("插件已卸载")
@@ -249,10 +263,12 @@ class WhitelistAuditPlugin(BotPlugin):
     async def handle_whitelist_command(self, user_id, group_id, command_text, websocket=None, **kwargs):
         """处理白名单审核申请"""
         try:
+            target_server = kwargs.get('target_server')
+            active_config = self._config_for_server(target_server)
             if not group_id:
                 return "请在QQ群内申请白名单"
             
-            if not self._is_group_allowed(group_id):
+            if not self._is_group_allowed(group_id, target_server):
                 return "此群组不支持白名单审核"
             
             game_id = command_text.strip()
@@ -263,28 +279,29 @@ class WhitelistAuditPlugin(BotPlugin):
                 return "游戏ID格式不正确\n要求: 3-16个字符，仅含字母、数字和下划线"
             
             # 检查冷却
-            cooldown_remaining = self._check_cooldown(user_id, game_id)
+            cooldown_remaining = self._check_cooldown(user_id, game_id, target_server)
             if cooldown_remaining > 0:
                 hours = cooldown_remaining // 3600
                 minutes = (cooldown_remaining % 3600) // 60
                 return f"审核冷却中\n请在 {hours}小时{minutes}分钟后重试"
             
             # 检查是否已在白名单
-            if self._is_in_whitelist(game_id):
+            if self._is_in_whitelist(game_id, target_server):
                 return f"游戏ID {game_id} 已在白名单中"
             
             # 检查用户已绑定的白名单数量
-            user_whitelist_count = self._get_user_whitelist_count(user_id)
-            max_allowed = self.config["max_whitelist_per_qq"]
+            user_whitelist_count = self._get_user_whitelist_count(user_id, target_server)
+            max_allowed = active_config["max_whitelist_per_qq"]
             if user_whitelist_count >= max_allowed:
                 return f"您已达到白名单绑定上限\n当前绑定: {user_whitelist_count}/{max_allowed}个\n如需绑定更多，请联系管理员"
             
             # 检查是否正在审核
-            if game_id in self.auditing_game_ids:
+            audit_key = self._audit_key(game_id, self._server_key(target_server))
+            if audit_key in self.auditing_game_ids:
                 return f"游戏ID {game_id} 正在被其他用户审核中，请稍后再试"
             
             # 检查是否正在审核（用户会话）
-            session_key = f"{user_id}_{group_id}"
+            session_key = self._session_key(user_id, group_id, kwargs.get('target_server'))
             if session_key in self.audit_sessions:
                 return "此ID正在审核中，请先完成当前审核"
             
@@ -294,7 +311,7 @@ class WhitelistAuditPlugin(BotPlugin):
             
             # 启动异步任务来准备题目和发送第一题
             asyncio.create_task(self._prepare_and_send_first_question(
-                session_key, user_id, group_id, game_id, websocket
+                session_key, user_id, group_id, game_id, websocket, target_server
             ))
             
             self.logger.info(f"用户 {user_id} 开始审核准备，游戏ID: {game_id}")
@@ -306,11 +323,12 @@ class WhitelistAuditPlugin(BotPlugin):
             self.logger.error(f"处理申请失败: {e}", exc_info=True)
             return f"处理失败: {str(e)}"
 
-    async def _prepare_and_send_first_question(self, session_key, user_id, group_id, game_id, websocket):
+    async def _prepare_and_send_first_question(self, session_key, user_id, group_id, game_id, websocket, target_server=None):
         """异步准备题目并发送第一题"""
         try:
+            active_config = self._config_for_server(target_server)
             # 获取题目
-            questions = await self._fetch_questions()
+            questions = await self._fetch_questions(active_config)
             if not questions:
                 error_msg = self._format_reply_with_at(user_id, "获取题目失败，请稍后重试")
                 await self._send_group_message(websocket, group_id, error_msg)
@@ -321,6 +339,8 @@ class WhitelistAuditPlugin(BotPlugin):
                 "user_id": user_id,
                 "game_id": game_id,
                 "group_id": group_id,
+                "server_key": self._server_key(target_server),
+                "config": active_config,
                 "questions": questions,
                 "answers": [],
                 "current_question_index": 0,
@@ -330,7 +350,7 @@ class WhitelistAuditPlugin(BotPlugin):
             }
             
             # 添加到正在审核的游戏ID集合
-            self.auditing_game_ids.add(game_id)
+            self.auditing_game_ids.add(self._audit_key(game_id, self._server_key(target_server)))
             
             # 启动第一道题的超时任务
             timeout_task = asyncio.create_task(
@@ -340,8 +360,8 @@ class WhitelistAuditPlugin(BotPlugin):
             
             # 发送第一道题
             first_question = questions[0]
-            timeout_minutes = self.config["answer_timeout"] // 60
-            total_questions = self.config["question_count"]
+            timeout_minutes = active_config["answer_timeout"] // 60
+            total_questions = active_config["question_count"]
             
             prompt = f"""【第1/{total_questions}题】
 
@@ -362,7 +382,7 @@ class WhitelistAuditPlugin(BotPlugin):
     async def _send_group_message(self, websocket, group_id, message):
         """发送群组消息"""
         try:
-            if websocket and not websocket.closed:
+            if self._websocket_open(websocket):
                 # 根据OneBot协议发送群消息
                 message_data = {
                     "action": "send_group_msg",
@@ -376,10 +396,21 @@ class WhitelistAuditPlugin(BotPlugin):
         except Exception as e:
             self.logger.error(f"发送群组消息失败: {e}")
 
+    def _websocket_open(self, websocket) -> bool:
+        if not websocket:
+            return False
+        closed = getattr(websocket, "closed", None)
+        if closed is not None:
+            return not closed
+        state = getattr(websocket, "state", None)
+        if state is not None:
+            return getattr(state, "name", "") == "OPEN"
+        return getattr(websocket, "close_code", None) is None
+
     async def handle_answer_command(self, user_id, group_id, command_text, websocket=None, **kwargs):
         """处理答案提交"""
         try:
-            session_key = f"{user_id}_{group_id}"
+            session_key = self._session_key(user_id, group_id, kwargs.get('target_server'))
             
             if session_key not in self.audit_sessions:
                 return "没有正在进行的审核会话"
@@ -392,10 +423,11 @@ class WhitelistAuditPlugin(BotPlugin):
                 return "答案过长，请简要回答"
             
             session = self.audit_sessions[session_key]
+            active_config = self._session_config(session)
             
             # 检查当前题目是否超时
             current_question_elapsed = time.time() - session["current_question_start_time"]
-            if current_question_elapsed > self.config["answer_timeout"]:
+            if current_question_elapsed > active_config["answer_timeout"]:
                 await self._handle_question_timeout(session_key, user_id, group_id, len(session["answers"]))
                 return "当前题目回复已超时"
             
@@ -411,14 +443,15 @@ class WhitelistAuditPlugin(BotPlugin):
             session["last_activity_time"] = time.time()
             
             current_progress = len(session["answers"])
-            total_questions = self.config["question_count"]
+            total_questions = active_config["question_count"]
             
             self.logger.info(f"用户 {user_id} 提交第 {current_progress} 题答案: {answer[:50]}...")
             
             # 检查是否完成
             if current_progress >= total_questions:
                 # 所有题目已回答,开始评分
-                await self._complete_audit(session_key, user_id, group_id, websocket)
+                rcon_client = kwargs.get('target_rcon_client') or kwargs.get('rcon_client')
+                await self._complete_audit(session_key, user_id, group_id, websocket, rcon_client)
                 return None  # 不返回消息，complete_audit会异步发送结果
             
             else:
@@ -429,7 +462,7 @@ class WhitelistAuditPlugin(BotPlugin):
                 next_index = current_progress
                 if next_index < len(session["questions"]):
                     next_question = session["questions"][next_index]
-                    timeout_minutes = self.config["answer_timeout"] // 60
+                    timeout_minutes = active_config["answer_timeout"] // 60
                     
                     # 计算进度百分比
                     progress_percent = (current_progress / total_questions) * 100
@@ -466,6 +499,7 @@ class WhitelistAuditPlugin(BotPlugin):
         """完成审核并评分"""
         try:
             session = self.audit_sessions[session_key]
+            active_config = self._session_config(session)
             game_id = session["game_id"]
             
             # 取消当前题目的超时任务（如果存在）
@@ -478,7 +512,8 @@ class WhitelistAuditPlugin(BotPlugin):
             # 评分
             score = await self._evaluate_answers(
                 session["questions"],
-                session["answers"]
+                session["answers"],
+                active_config
             )
             
             # 保存记录
@@ -486,10 +521,11 @@ class WhitelistAuditPlugin(BotPlugin):
                 "user_id": user_id,
                 "game_id": game_id,
                 "group_id": group_id,
+                "server_key": session.get("server_key", "default"),
                 "questions": session["questions"],
                 "answers": session["answers"],
                 "score": score,
-                "passed": score >= self.config["pass_score"],
+                "passed": score >= active_config["pass_score"],
                 "start_time": session["start_time"],
                 "end_time": datetime.now().isoformat()
             }
@@ -497,37 +533,40 @@ class WhitelistAuditPlugin(BotPlugin):
             self._save_audit_record(record)
             
             # 从正在审核的游戏ID集合中移除
-            if game_id in self.auditing_game_ids:
-                self.auditing_game_ids.remove(game_id)
+            audit_key = self._audit_key(game_id, session.get("server_key", "default"))
+            if audit_key in self.auditing_game_ids:
+                self.auditing_game_ids.remove(audit_key)
             
             # 清除会话
             del self.audit_sessions[session_key]
             self._save_data()
             
-            total_score = self.config["question_count"] * 10
+            total_score = active_config["question_count"] * 10
             
-            if score >= self.config["pass_score"]:
+            if score >= active_config["pass_score"]:
                 # 审核通过，尝试添加到服务器白名单
-                success = await self._add_to_server_whitelist(game_id, rcon_client)
+                success = await self._add_to_server_whitelist(game_id, rcon_client, active_config)
                 
                 if success:
-                    self._add_to_whitelist(game_id, user_id, group_id)
+                    server_key = session.get("server_key")
+                    self._add_to_whitelist(game_id, user_id, group_id, server_key=server_key)
                     result_message = f"""恭喜！审核通过！
 总分: {score}/{total_score}
 游戏ID {game_id} 已加入服务器白名单
-当前绑定: {self._get_user_whitelist_count(user_id)}/{self.config['max_whitelist_per_qq']}个"""
+当前绑定: {self._get_user_whitelist_count(user_id, server_key=server_key)}/{active_config['max_whitelist_per_qq']}个"""
                 else:
                     # RCON添加失败，只记录到插件白名单
-                    self._add_to_whitelist(game_id, user_id, group_id)
+                    server_key = session.get("server_key")
+                    self._add_to_whitelist(game_id, user_id, group_id, server_key=server_key)
                     result_message = f"""审核通过但服务器添加失败
 总分: {score}/{total_score}
 游戏ID {game_id} 已记录到插件白名单，但需要手动添加到服务器
-当前绑定: {self._get_user_whitelist_count(user_id)}/{self.config['max_whitelist_per_qq']}个"""
+当前绑定: {self._get_user_whitelist_count(user_id, server_key=server_key)}/{active_config['max_whitelist_per_qq']}个"""
             else:
-                self._set_cooldown(user_id, game_id)
+                self._set_cooldown(user_id, game_id, server_key=session.get("server_key"), config=active_config)
                 result_message = f"""未通过审核
-得分: {score}/{total_score}（及格线: {self.config['pass_score']}分）
-请在 {self.config['cooldown_seconds']//3600} 小时后重试"""
+得分: {score}/{total_score}（及格线: {active_config['pass_score']}分）
+请在 {active_config['cooldown_seconds']//3600} 小时后重试"""
             
             # 异步发送结果
             result_message_with_at = self._format_reply_with_at(user_id, result_message)
@@ -543,7 +582,9 @@ class WhitelistAuditPlugin(BotPlugin):
     async def _check_question_timeout(self, session_key: str, user_id: int, group_id: int, question_index: int):
         """检查单道题目超时"""
         try:
-            await asyncio.sleep(self.config["answer_timeout"])
+            session = self.audit_sessions.get(session_key)
+            active_config = self._session_config(session)
+            await asyncio.sleep(active_config["answer_timeout"])
             
             # 添加会话有效性检查
             if session_key not in self.audit_sessions:
@@ -557,7 +598,8 @@ class WhitelistAuditPlugin(BotPlugin):
             
             # 添加游戏ID检查
             game_id = session.get("game_id")
-            if game_id not in self.auditing_game_ids:
+            audit_key = self._audit_key(game_id, session.get("server_key", "default"))
+            if audit_key not in self.auditing_game_ids:
                 return
                 
             await self._handle_question_timeout(session_key, user_id, group_id, question_index)
@@ -573,6 +615,7 @@ class WhitelistAuditPlugin(BotPlugin):
             return
         
         session = self.audit_sessions[session_key]
+        active_config = self._session_config(session)
         game_id = session["game_id"]
         
         # 只处理当前题目的超时（防止旧任务误触发）
@@ -584,14 +627,16 @@ class WhitelistAuditPlugin(BotPlugin):
             session["answers"].append("")  # 超时未答
         
         # 从正在审核的游戏ID集合中移除
-        if game_id in self.auditing_game_ids:
-            self.auditing_game_ids.remove(game_id)
+        audit_key = self._audit_key(game_id, session.get("server_key", "default"))
+        if audit_key in self.auditing_game_ids:
+            self.auditing_game_ids.remove(audit_key)
         
         # 保存记录
         record = {
             "user_id": user_id,
             "game_id": game_id,
             "group_id": group_id,
+            "server_key": session.get("server_key", "default"),
             "questions": session["questions"],
             "answers": session["answers"],
             "score": 0,
@@ -602,7 +647,7 @@ class WhitelistAuditPlugin(BotPlugin):
         }
         
         self._save_audit_record(record)
-        self._set_cooldown(user_id, game_id)
+        self._set_cooldown(user_id, game_id, server_key=session.get("server_key", "default"), config=active_config)
         
         # 清除任务
         if session_key in self.timeout_tasks:
@@ -612,25 +657,44 @@ class WhitelistAuditPlugin(BotPlugin):
         self._save_data()
         self.logger.warning(f"用户 {user_id} 第{question_index + 1}题超时")
     
-    async def _add_to_server_whitelist(self, game_id: str, rcon_client=None) -> bool:
-        """通过RCON将游戏ID添加到服务器白名单"""
+    async def _execute_rcon_command(self, rcon_client, command: str):
+        """兼容持久 RCON 和多服务器短连接 RCON 代理。"""
         try:
-            # 检查 RCON 客户端是否可用
             if not rcon_client:
                 self.logger.debug("RCON 客户端不可用")
-                return False
-            
+                return None
+
+            if hasattr(rcon_client, "run_connected"):
+                connected, result = await asyncio.to_thread(
+                    rcon_client.run_connected,
+                    lambda client: client.execute_command(command)
+                )
+                if not connected:
+                    self.logger.debug("RCON 连接不可用")
+                    return None
+                return result
+
             if not rcon_client.is_connected():
                 self.logger.debug("RCON 连接不可用")
-                return False
-            
+                return None
+
+            return await asyncio.to_thread(rcon_client.execute_command, command)
+        except Exception as e:
+            self.logger.error(f"执行 RCON 命令失败: {e}")
+            return None
+
+    async def _add_to_server_whitelist(self, game_id: str, rcon_client=None,
+                                       config: Optional[Dict] = None) -> bool:
+        """通过RCON将游戏ID添加到服务器白名单"""
+        try:
+            active_config = config or self.config
             # 使用自定义指令格式
-            command_template = self.config["custom_whitelist_commands"]["add_command"]
+            command_template = active_config["custom_whitelist_commands"]["add_command"]
             command = command_template.format(player=game_id)
             
             self.logger.info(f"通过RCON执行命令: {command}")
             
-            result = rcon_client.execute_command(command)
+            result = await self._execute_rcon_command(rcon_client, command)
             self.logger.info(f"RCON执行结果: {result}")
             
             # 检查执行结果 - 放宽条件，只要不是 None 就认为成功
@@ -640,17 +704,19 @@ class WhitelistAuditPlugin(BotPlugin):
             else:
                 self.logger.warning(f"RCON添加白名单失败: 返回None")
                 # 即使返回None，也尝试检查是否真的添加成功
-                return await self._check_whitelist_status(game_id, rcon_client)
+                return await self._check_whitelist_status(game_id, rcon_client, active_config)
                 
         except Exception as e:
             self.logger.error(f"通过RCON添加白名单失败: {e}")
             return False
 
-    async def _check_whitelist_status(self, game_id: str, rcon_client) -> bool:
+    async def _check_whitelist_status(self, game_id: str, rcon_client,
+                                      config: Optional[Dict] = None) -> bool:
         """检查玩家是否在白名单中"""
         try:
-            command_template = self.config["custom_whitelist_commands"]["list_command"]
-            result = rcon_client.execute_command(command_template)
+            active_config = config or self.config
+            command_template = active_config["custom_whitelist_commands"]["list_command"]
+            result = await self._execute_rcon_command(rcon_client, command_template)
             
             if result and game_id in result:
                 self.logger.info(f"验证成功: {game_id} 在白名单中")
@@ -665,17 +731,19 @@ class WhitelistAuditPlugin(BotPlugin):
     async def handle_status(self, user_id, group_id, command_text, **kwargs):
         """查看审核状态"""
         try:
-            session_key = f"{user_id}_{group_id}"
+            session_key = self._session_key(user_id, group_id, kwargs.get('target_server'))
+            target_server = kwargs.get('target_server')
             
             if session_key in self.audit_sessions:
                 session = self.audit_sessions[session_key]
+                active_config = self._session_config(session)
                 progress = len(session["answers"])
-                total = self.config["question_count"]
+                total = active_config["question_count"]
                 game_id = session["game_id"]
                 
                 # 计算当前题目的剩余时间
                 current_question_elapsed = time.time() - session["current_question_start_time"]
-                remaining_time = max(0, self.config["answer_timeout"] - current_question_elapsed)
+                remaining_time = max(0, active_config["answer_timeout"] - current_question_elapsed)
                 minutes = int(remaining_time // 60)
                 seconds = int(remaining_time % 60)
                 
@@ -688,14 +756,18 @@ class WhitelistAuditPlugin(BotPlugin):
                 
                 return self._format_reply_with_at(user_id, status_message)
             
-            user_records = self.audit_records.get(str(user_id), [])
+            user_records = [
+                record for record in self.audit_records.get(str(user_id), [])
+                if record.get("server_key", "default") == self._server_key(target_server)
+            ]
             if user_records:
+                active_config = self._config_for_server(target_server)
                 latest = user_records[-1]
                 status = "已通过" if latest["passed"] else "未通过"
-                user_whitelist_count = self._get_user_whitelist_count(user_id)
-                max_allowed = self.config["max_whitelist_per_qq"]
+                user_whitelist_count = self._get_user_whitelist_count(user_id, target_server)
+                max_allowed = active_config["max_whitelist_per_qq"]
                 
-                total_score = self.config["question_count"] * 10
+                total_score = active_config["question_count"] * 10
                 status_message = f"""最后一次审核
 游戏ID: {latest['game_id']}
 状态: {status}
@@ -713,15 +785,22 @@ class WhitelistAuditPlugin(BotPlugin):
     async def handle_list(self, user_id, group_id, command_text, **kwargs):
         """查看白名单"""
         try:
-            if not self.whitelist:
+            target_server = kwargs.get('target_server')
+            server_key = self._server_key(target_server)
+            server_whitelist = [
+                (info.get("game_id") or key, info)
+                for key, info in self.whitelist.items()
+                if self._entry_server_key(key, info) == server_key
+            ]
+            if not server_whitelist:
                 return "白名单为空"
             
             lines = ["=== 服务器白名单 ==="]
-            for i, (game_id, info) in enumerate(list(self.whitelist.items())[:20], 1):
+            for i, (game_id, info) in enumerate(server_whitelist[:20], 1):
                 lines.append(f"{i}. {game_id}")
             
-            if len(self.whitelist) > 20:
-                lines.append(f"\n... 还有 {len(self.whitelist) - 20} 个玩家")
+            if len(server_whitelist) > 20:
+                lines.append(f"\n... 还有 {len(server_whitelist) - 20} 个玩家")
             
             return "\n".join(lines)
         
@@ -732,6 +811,9 @@ class WhitelistAuditPlugin(BotPlugin):
     async def handle_admin(self, user_id, group_id, command_text, rcon_client=None, **kwargs):
         """管理员操作"""
         try:
+            target_server = kwargs.get('target_server')
+            server_key = self._server_key(target_server)
+            active_config = self._config_for_server(target_server)
             parts = command_text.strip().split()
             if not parts:
                 return "子命令: add <游戏ID> | remove <游戏ID> | clear | reload | sessions | reset <用户ID> | sync | config | set_max <QQ号> <数量> | set_command <类型> <指令>"
@@ -741,21 +823,22 @@ class WhitelistAuditPlugin(BotPlugin):
             if action == "add" and len(parts) > 1:
                 game_id = parts[1]
                 # 先尝试通过RCON添加到服务器
-                success = await self._add_to_server_whitelist(game_id, rcon_client)
+                success = await self._add_to_server_whitelist(game_id, rcon_client, active_config)
                 if success:
-                    self._add_to_whitelist(game_id, user_id, group_id, admin=True)
+                    self._add_to_whitelist(game_id, user_id, group_id, admin=True, target_server=target_server)
                     return f"已将 {game_id} 加入服务器白名单"
                 else:
                     # RCON失败，只添加到插件白名单
-                    self._add_to_whitelist(game_id, user_id, group_id, admin=True)
+                    self._add_to_whitelist(game_id, user_id, group_id, admin=True, target_server=target_server)
                     return f"已将 {game_id} 加入插件白名单，但服务器添加失败，请手动处理"
             
             elif action == "remove" and len(parts) > 1:
                 game_id = parts[1]
-                if game_id in self.whitelist:
+                whitelist_key = self._whitelist_key(game_id, target_server)
+                if whitelist_key in self.whitelist:
                     # 同时从服务器白名单移除
-                    success = await self._remove_from_server_whitelist(game_id, rcon_client)
-                    del self.whitelist[game_id]
+                    success = await self._remove_from_server_whitelist(game_id, rcon_client, active_config)
+                    del self.whitelist[whitelist_key]
                     self._save_data()
                     if success:
                         return f"已从服务器和插件白名单中移出 {game_id}"
@@ -764,10 +847,15 @@ class WhitelistAuditPlugin(BotPlugin):
                 return "未找到该游戏ID"
             
             elif action == "clear":
-                # 清空插件白名单
-                self.whitelist.clear()
+                # 清空当前目标服务器的插件白名单
+                keys_to_remove = [
+                    key for key, info in self.whitelist.items()
+                    if self._entry_server_key(key, info) == server_key
+                ]
+                for key in keys_to_remove:
+                    del self.whitelist[key]
                 self._save_data()
-                return "已清空白名单"
+                return f"已清空当前服务器白名单，共 {len(keys_to_remove)} 条"
             
             elif action == "reload":
                 self._load_data()
@@ -780,13 +868,18 @@ class WhitelistAuditPlugin(BotPlugin):
                 
                 lines = ["当前审核会话:"]
                 for key, session in self.audit_sessions.items():
+                    if session.get("server_key", "default") != server_key:
+                        continue
+                    session_config = self._session_config(session)
                     progress = len(session["answers"])
-                    total = self.config["question_count"]
+                    total = session_config["question_count"]
                     elapsed = int(time.time() - session["current_question_start_time"])
-                    remaining = max(0, self.config["answer_timeout"] - elapsed)
+                    remaining = max(0, session_config["answer_timeout"] - elapsed)
                     minutes = int(remaining // 60)
                     seconds = int(remaining % 60)
                     lines.append(f"- {session['game_id']}: {progress}/{total}题 (剩余: {minutes}分{seconds}秒)")
+                if len(lines) == 1:
+                    return "当前服务器无活跃审核会话"
                 
                 return "\n".join(lines)
             
@@ -794,8 +887,8 @@ class WhitelistAuditPlugin(BotPlugin):
                 # 重置用户会话
                 target_user_id = parts[1]
                 session_key_to_remove = None
-                for key in self.audit_sessions.keys():
-                    if key.startswith(f"{target_user_id}_"):
+                for key, session in self.audit_sessions.items():
+                    if key.startswith(f"{target_user_id}_") and session.get("server_key", "default") == server_key:
                         session_key_to_remove = key
                         break
                 
@@ -804,8 +897,9 @@ class WhitelistAuditPlugin(BotPlugin):
                     game_id = session["game_id"]
                     
                     # 从正在审核的游戏ID集合中移除
-                    if game_id in self.auditing_game_ids:
-                        self.auditing_game_ids.remove(game_id)
+                    audit_key = self._audit_key(game_id, session.get("server_key", "default"))
+                    if audit_key in self.auditing_game_ids:
+                        self.auditing_game_ids.remove(audit_key)
                     
                     # 取消超时任务
                     if session_key_to_remove in self.timeout_tasks:
@@ -826,8 +920,13 @@ class WhitelistAuditPlugin(BotPlugin):
                 fail_count = 0
                 results = []
                 
-                for game_id in list(self.whitelist.keys()):
-                    success = await self._add_to_server_whitelist(game_id, rcon_client)
+                server_whitelist = [
+                    (info.get("game_id") or key, info)
+                    for key, info in self.whitelist.items()
+                    if self._entry_server_key(key, info) == server_key
+                ]
+                for game_id, _info in server_whitelist:
+                    success = await self._add_to_server_whitelist(game_id, rcon_client, active_config)
                     if success:
                         success_count += 1
                         results.append(f"{game_id} 成功")
@@ -845,25 +944,25 @@ class WhitelistAuditPlugin(BotPlugin):
             
             elif action == "config":
                 """查看当前配置"""
-                total_score = self.config["question_count"] * 10
+                total_score = active_config["question_count"] * 10
                 config_info = [
-                    "当前配置:",
-                    f"AI出题: {'开启' if self.config['use_ai_questions'] else '关闭'}",
-                    f"题目数量: {self.config['question_count']}题",
+                    f"当前配置 ({target_server.get('name') if target_server else server_key}):",
+                    f"AI出题: {'开启' if active_config['use_ai_questions'] else '关闭'}",
+                    f"题目数量: {active_config['question_count']}题",
                     f"总分: {total_score}分",
-                    f"及格分数: {self.config['pass_score']}分",
-                    f"答题超时: {self.config['answer_timeout']//60}分钟",
-                    f"冷却时间: {self.config['cooldown_seconds']//3600}小时",
-                    f"每个QQ号最大绑定: {self.config['max_whitelist_per_qq']}个",
-                    f"允许群组: {len(self.config['allowed_groups'])}个",
+                    f"及格分数: {active_config['pass_score']}分",
+                    f"答题超时: {active_config['answer_timeout']//60}分钟",
+                    f"冷却时间: {active_config['cooldown_seconds']//3600}小时",
+                    f"每个QQ号最大绑定: {active_config['max_whitelist_per_qq']}个",
+                    f"允许群组: {len(active_config['allowed_groups'])}个",
                     "",
                     "自定义白名单指令:",
-                    f"添加: {self.config['custom_whitelist_commands']['add_command']}",
-                    f"移除: {self.config['custom_whitelist_commands']['remove_command']}",
-                    f"列表: {self.config['custom_whitelist_commands']['list_command']}",
-                    f"开启: {self.config['custom_whitelist_commands']['on_command']}",
-                    f"关闭: {self.config['custom_whitelist_commands']['off_command']}",
-                    f"重载: {self.config['custom_whitelist_commands']['reload_command']}"
+                    f"添加: {active_config['custom_whitelist_commands']['add_command']}",
+                    f"移除: {active_config['custom_whitelist_commands']['remove_command']}",
+                    f"列表: {active_config['custom_whitelist_commands']['list_command']}",
+                    f"开启: {active_config['custom_whitelist_commands']['on_command']}",
+                    f"关闭: {active_config['custom_whitelist_commands']['off_command']}",
+                    f"重载: {active_config['custom_whitelist_commands']['reload_command']}"
                 ]
                 return "\n".join(config_info)
             
@@ -876,9 +975,9 @@ class WhitelistAuditPlugin(BotPlugin):
                     if new_max < 1:
                         return "最大绑定数量必须大于0"
                     
-                    old_max = self.config["max_whitelist_per_qq"]
-                    self.config["max_whitelist_per_qq"] = new_max
-                    self._save_config()
+                    old_max = active_config["max_whitelist_per_qq"]
+                    active_config["max_whitelist_per_qq"] = new_max
+                    self._save_config_for_server(active_config, target_server, server_key)
                     
                     return f"已将每个QQ号最大白名单绑定数量从 {old_max} 改为 {new_max}"
                 
@@ -894,9 +993,9 @@ class WhitelistAuditPlugin(BotPlugin):
                 if command_type not in valid_types:
                     return f"无效的指令类型，可用类型: {', '.join(valid_types)}"
                 
-                old_command = self.config["custom_whitelist_commands"][f"{command_type}_command"]
-                self.config["custom_whitelist_commands"][f"{command_type}_command"] = new_command
-                self._save_config()
+                old_command = active_config["custom_whitelist_commands"][f"{command_type}_command"]
+                active_config["custom_whitelist_commands"][f"{command_type}_command"] = new_command
+                self._save_config_for_server(active_config, target_server, server_key)
                 
                 return f"已更新 {command_type} 指令:\n旧: {old_command}\n新: {new_command}"
             
@@ -907,25 +1006,18 @@ class WhitelistAuditPlugin(BotPlugin):
             self.logger.error(f"管理操作失败: {e}", exc_info=True)
             return "操作失败"
     
-    async def _remove_from_server_whitelist(self, game_id: str, rcon_client=None) -> bool:
+    async def _remove_from_server_whitelist(self, game_id: str, rcon_client=None,
+                                            config: Optional[Dict] = None) -> bool:
         """通过RCON从服务器白名单移除游戏ID"""
         try:
-            # 检查 RCON 客户端是否可用
-            if not rcon_client:
-                self.logger.debug("RCON 客户端不可用")
-                return False
-            
-            if not rcon_client.is_connected():
-                self.logger.debug("RCON 连接不可用")
-                return False
-            
+            active_config = config or self.config
             # 使用自定义指令格式
-            command_template = self.config["custom_whitelist_commands"]["remove_command"]
+            command_template = active_config["custom_whitelist_commands"]["remove_command"]
             command = command_template.format(player=game_id)
             
             self.logger.info(f"通过RCON执行移除命令: {command}")
             
-            result = rcon_client.execute_command(command)
+            result = await self._execute_rcon_command(rcon_client, command)
             self.logger.info(f"RCON移除结果: {result}")
             
             # 检查执行结果 - 放宽条件，只要不是 None 就认为成功
@@ -935,17 +1027,19 @@ class WhitelistAuditPlugin(BotPlugin):
             else:
                 self.logger.warning(f"RCON移除白名单失败: 返回None")
                 # 即使返回None，也尝试检查是否真的移除了
-                return await self._check_whitelist_removed(game_id, rcon_client)
+                return await self._check_whitelist_removed(game_id, rcon_client, active_config)
                 
         except Exception as e:
             self.logger.error(f"通过RCON移除白名单失败: {e}")
             return False
 
-    async def _check_whitelist_removed(self, game_id: str, rcon_client) -> bool:
+    async def _check_whitelist_removed(self, game_id: str, rcon_client,
+                                       config: Optional[Dict] = None) -> bool:
         """检查玩家是否已从白名单中移除"""
         try:
-            command_template = self.config["custom_whitelist_commands"]["list_command"]
-            result = rcon_client.execute_command(command_template)
+            active_config = config or self.config
+            command_template = active_config["custom_whitelist_commands"]["list_command"]
+            result = await self._execute_rcon_command(rcon_client, command_template)
             
             if result and game_id not in result:
                 self.logger.info(f"验证成功: {game_id} 已从白名单中移除")
@@ -959,46 +1053,48 @@ class WhitelistAuditPlugin(BotPlugin):
     
     # ==================== 题目获取 ====================
     
-    async def _fetch_questions(self) -> Optional[List[str]]:
+    async def _fetch_questions(self, config: Optional[Dict] = None) -> Optional[List[str]]:
         """获取题目"""
-        if self.config["use_ai_questions"]:
-            questions = await self._fetch_questions_from_ai()
-            if questions and len(questions) >= self.config["question_count"]:
-                return questions[:self.config["question_count"]]
+        active_config = config or self.config
+        if active_config["use_ai_questions"]:
+            questions = await self._fetch_questions_from_ai(active_config)
+            if questions and len(questions) >= active_config["question_count"]:
+                return questions[:active_config["question_count"]]
         
         # 使用默认题目
-        return self._get_default_questions()
+        return self._get_default_questions(active_config)
     
-    async def _fetch_questions_from_ai(self) -> Optional[List[str]]:
+    async def _fetch_questions_from_ai(self, config: Optional[Dict] = None) -> Optional[List[str]]:
         """从AI获取题目 - 带重试机制"""
+        active_config = config or self.config
         max_retries = 3
         retry_delay = 2
         
         for attempt in range(max_retries):
             try:
                 # 动态生成提示词
-                total_score = self.config["question_count"] * 10
-                prompt = self.config["question_prompt"].format(
-                    question_count=self.config["question_count"],
-                    pass_score=self.config["pass_score"],
+                total_score = active_config["question_count"] * 10
+                prompt = active_config["question_prompt"].format(
+                    question_count=active_config["question_count"],
+                    pass_score=active_config["pass_score"],
                     total_score=total_score
                 )
                 
                 if AsyncOpenAI:
                     client = AsyncOpenAI(
-                        api_key=self.config['ai_api_key'],
-                        base_url=self.config['ai_api_url']
+                        api_key=active_config['ai_api_key'],
+                        base_url=active_config['ai_api_url']
                     )
                     
                     response = await client.chat.completions.create(
-                        model=self.config["ai_model"],
+                        model=active_config["ai_model"],
                         messages=[
                             {"role": "system", "content": "你是一个我的世界服务器审核出题官"},
                             {"role": "user", "content": prompt}
                         ],
                         temperature=0.7,
                         max_tokens=2000,
-                        timeout=self.config["ai_timeout"]
+                        timeout=active_config["ai_timeout"]
                     )
                     
                     response_text = response.choices[0].message.content
@@ -1006,11 +1102,11 @@ class WhitelistAuditPlugin(BotPlugin):
                     # 解析题目
                     questions = self._parse_questions(response_text)
                     
-                    if len(questions) >= self.config["question_count"]:
+                    if len(questions) >= active_config["question_count"]:
                         self.logger.info(f"成功从AI获取 {len(questions)} 道题目")
                         return questions
                     else:
-                        self.logger.warning(f"AI出题数量不足: {len(questions)}/{self.config['question_count']}")
+                        self.logger.warning(f"AI出题数量不足: {len(questions)}/{active_config['question_count']}")
                         if attempt < max_retries - 1:
                             self.logger.info(f"等待 {retry_delay} 秒后重试... (尝试 {attempt + 1}/{max_retries})")
                             await asyncio.sleep(retry_delay)
@@ -1032,11 +1128,12 @@ class WhitelistAuditPlugin(BotPlugin):
         
         return None
     
-    def _get_default_questions(self) -> List[str]:
+    def _get_default_questions(self, config: Optional[Dict] = None) -> List[str]:
         """从默认题目中随机抽取"""
         import random
-        default_questions = self.config["default_questions"]
-        question_count = self.config["question_count"]
+        active_config = config or self.config
+        default_questions = active_config["default_questions"]
+        question_count = active_config["question_count"]
         
         if len(default_questions) <= question_count:
             return default_questions[:question_count]
@@ -1061,9 +1158,11 @@ class WhitelistAuditPlugin(BotPlugin):
         
         return questions
     
-    async def _evaluate_answers(self, questions: List[str], answers: List[str]) -> int:
+    async def _evaluate_answers(self, questions: List[str], answers: List[str],
+                                config: Optional[Dict] = None) -> int:
         """评分 - 优化版本"""
         try:
+            active_config = config or self.config
             # 检查是否有空答案(超时未答)
             empty_count = sum(1 for a in answers if not a.strip())
             if empty_count > 0:
@@ -1074,7 +1173,7 @@ class WhitelistAuditPlugin(BotPlugin):
                 answer_text = a if a.strip() else "[未作答]"
                 qa_text += f"{i}. 题目: {q}\n   答案: {answer_text}\n\n"
             
-            total_score = self.config["question_count"] * 10
+            total_score = active_config["question_count"] * 10
             prompt = f"""请根据以下问答进行评分,每题满分10分,一共{total_score}分。
 评分标准:
 - 答案合理且符合服务器规则:8-10分
@@ -1092,22 +1191,22 @@ class WhitelistAuditPlugin(BotPlugin):
                 try:
                     if AsyncOpenAI:
                         client = AsyncOpenAI(
-                            api_key=self.config['ai_api_key'],
-                            base_url=self.config['ai_api_url']
+                            api_key=active_config['ai_api_key'],
+                            base_url=active_config['ai_api_url']
                         )
                         
                         response = await asyncio.wait_for(
                             client.chat.completions.create(
-                                model=self.config["ai_model"],
+                                model=active_config["ai_model"],
                                 messages=[
                                     {"role": "system", "content": "你是一个严格的评分官"},
                                     {"role": "user", "content": prompt}
                                 ],
                                 temperature=0.3,
                                 max_tokens=50,
-                                timeout=self.config["ai_timeout"]
+                                timeout=active_config["ai_timeout"]
                             ),
-                            timeout=self.config["ai_timeout"] + 5
+                            timeout=active_config["ai_timeout"] + 5
                         )
                         
                         response_text = response.choices[0].message.content
@@ -1158,11 +1257,12 @@ class WhitelistAuditPlugin(BotPlugin):
     
     def _load_config(self):
         """加载配置"""
+        self.config = copy.deepcopy(self.DEFAULT_CONFIG)
         if os.path.exists(self.CONFIG_FILE):
             try:
                 with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
                     loaded_config = json.load(f)
-                    self.config.update(loaded_config)
+                    self.config = self._deep_merge(self.config, loaded_config)
                 self.logger.info("配置已加载")
             except Exception as e:
                 self.logger.error(f"加载配置失败: {e}")
@@ -1178,51 +1278,244 @@ class WhitelistAuditPlugin(BotPlugin):
             self.logger.info("配置已保存")
         except Exception as e:
             self.logger.error(f"保存配置失败: {e}")
+
+    def _deep_merge(self, base: Dict, override: Dict) -> Dict:
+        """深度合并配置，避免嵌套配置被浅拷贝污染。"""
+        result = copy.deepcopy(base)
+        for key, value in (override or {}).items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
+
+    def _config_for_server(self, target_server: Optional[Dict] = None,
+                           server_key: Optional[str] = None) -> Dict:
+        """读取目标服务器独立插件配置，找不到则回退根配置。"""
+        config = self._deep_merge(self.DEFAULT_CONFIG, self.config or {})
+        path = None
+        try:
+            if server_key and self.plugin_manager and hasattr(self.plugin_manager, "get_plugin_server_file_by_key"):
+                path = self.plugin_manager.get_plugin_server_file_by_key(
+                    "whitelist_audit", server_key, "config.json", create_parent=False
+                )
+            elif self.plugin_manager and hasattr(self.plugin_manager, "get_plugin_server_file"):
+                path = self.plugin_manager.get_plugin_server_file(
+                    "whitelist_audit", "config.json", target_server or {}, create_parent=False
+                )
+            if path and os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    config = self._deep_merge(config, loaded)
+        except Exception as e:
+            self.logger.error(f"读取服务器插件配置失败 {path}: {e}")
+        return config
+
+    def _save_config_for_server(self, config: Dict, target_server: Optional[Dict] = None,
+                                server_key: Optional[str] = None):
+        """保存目标服务器独立插件配置。"""
+        path = None
+        try:
+            if server_key and self.plugin_manager and hasattr(self.plugin_manager, "get_plugin_server_file_by_key"):
+                path = self.plugin_manager.get_plugin_server_file_by_key(
+                    "whitelist_audit", server_key, "config.json", create_parent=True
+                )
+            elif self.plugin_manager and hasattr(self.plugin_manager, "get_plugin_server_file"):
+                path = self.plugin_manager.get_plugin_server_file(
+                    "whitelist_audit", "config.json", target_server or {}, create_parent=True
+                )
+            if path:
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+                self.logger.info(f"服务器配置已保存: {path}")
+                return
+        except Exception as e:
+            self.logger.error(f"保存服务器插件配置失败 {path}: {e}")
+
+        self.config = self._deep_merge(self.DEFAULT_CONFIG, config or {})
+        self._save_config()
+
+    def _session_config(self, session: Optional[Dict]) -> Dict:
+        if isinstance(session, dict) and isinstance(session.get("config"), dict):
+            return session["config"]
+        if isinstance(session, dict):
+            return self._config_for_server(server_key=session.get("server_key"))
+        return self.config
     
     def _load_data(self):
         """加载数据"""
-        # 加载审核记录
-        if os.path.exists(self.AUDIT_RECORDS_FILE):
-            try:
-                with open(self.AUDIT_RECORDS_FILE, 'r', encoding='utf-8') as f:
-                    self.audit_records = json.load(f)
-            except Exception as e:
-                self.logger.error(f"加载审核记录失败: {e}")
-                self.audit_records = {}
-        
-        # 加载白名单
-        if os.path.exists(self.WHITELIST_FILE):
-            try:
-                with open(self.WHITELIST_FILE, 'r', encoding='utf-8') as f:
-                    self.whitelist = json.load(f)
-            except Exception as e:
-                self.logger.error(f"加载白名单失败: {e}")
-                self.whitelist = {}
-        
-        # 加载冷却数据
-        if os.path.exists(self.COOLDOWN_FILE):
-            try:
-                with open(self.COOLDOWN_FILE, 'r', encoding='utf-8') as f:
-                    self.cooldown = json.load(f)
-            except Exception as e:
-                self.logger.error(f"加载冷却数据失败: {e}")
-                self.cooldown = {}
+        """加载全局旧数据和每服务器独立数据。"""
+        self.audit_records = {}
+        self.whitelist = {}
+        self.cooldown = {}
+
+        server_files = self._server_data_files()
+        has_server_data = any(
+            os.path.exists(path)
+            for paths in server_files.values()
+            for path in paths.values()
+        )
+        if not has_server_data:
+            self._merge_audit_records(self._read_json_file(self.AUDIT_RECORDS_FILE))
+            self._merge_whitelist(self._read_json_file(self.WHITELIST_FILE))
+            self._merge_cooldown(self._read_json_file(self.COOLDOWN_FILE))
+
+        for server_key, paths in server_files.items():
+            self._merge_audit_records(self._read_json_file(paths["audit_records"]), server_key)
+            self._merge_whitelist(self._read_json_file(paths["whitelist"]), server_key)
+            self._merge_cooldown(self._read_json_file(paths["cooldown"]), server_key)
     
     def _save_data(self):
-        """保存数据"""
+        """按服务器拆分保存数据"""
         try:
-            with open(self.AUDIT_RECORDS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.audit_records, f, ensure_ascii=False, indent=2)
-            
-            with open(self.WHITELIST_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.whitelist, f, ensure_ascii=False, indent=2)
-            
-            with open(self.COOLDOWN_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.cooldown, f, ensure_ascii=False, indent=2)
+            audit_records = self._group_audit_records()
+            whitelist_data = self._group_whitelist()
+            cooldown_data = self._group_cooldown()
+            server_keys = set(self._server_data_files().keys())
+            server_keys.update(audit_records.keys())
+            server_keys.update(whitelist_data.keys())
+            server_keys.update(cooldown_data.keys())
+
+            for server_key in sorted(server_keys):
+                with open(self._server_data_file(server_key, "audit_records.json"), 'w', encoding='utf-8') as f:
+                    json.dump(audit_records.get(server_key, {}), f, ensure_ascii=False, indent=2)
+
+            for server_key in sorted(server_keys):
+                with open(self._server_data_file(server_key, "whitelist.json"), 'w', encoding='utf-8') as f:
+                    json.dump(whitelist_data.get(server_key, {}), f, ensure_ascii=False, indent=2)
+
+            for server_key in sorted(server_keys):
+                with open(self._server_data_file(server_key, "cooldown.json"), 'w', encoding='utf-8') as f:
+                    json.dump(cooldown_data.get(server_key, {}), f, ensure_ascii=False, indent=2)
             
             self.logger.info("数据已保存")
         except Exception as e:
             self.logger.error(f"保存数据失败: {e}")
+
+    def _read_json_file(self, path):
+        try:
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            self.logger.error(f"读取数据文件失败 {path}: {e}")
+        return {}
+
+    def _merge_audit_records(self, incoming, server_key: Optional[str] = None):
+        if not isinstance(incoming, dict):
+            return
+        seen = {
+            (
+                str(user_id),
+                str(record.get("game_id")),
+                str(record.get("audit_time") or record.get("start_time")),
+                str(record.get("server_key", "default")),
+            )
+            for user_id, records in self.audit_records.items()
+            for record in records
+            if isinstance(record, dict)
+        }
+        for user_id, records in incoming.items():
+            if not isinstance(records, list):
+                continue
+            target = self.audit_records.setdefault(str(user_id), [])
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                item = dict(record)
+                if server_key and not item.get("server_key"):
+                    item["server_key"] = server_key
+                key = (
+                    str(user_id),
+                    str(item.get("game_id")),
+                    str(item.get("audit_time") or item.get("start_time")),
+                    str(item.get("server_key", "default")),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                target.append(item)
+
+    def _merge_whitelist(self, incoming, server_key: Optional[str] = None):
+        if not isinstance(incoming, dict):
+            return
+        for key, info in incoming.items():
+            if not isinstance(info, dict):
+                continue
+            item = dict(info)
+            if server_key and not item.get("server_key"):
+                item["server_key"] = server_key
+            entry_key = key
+            if server_key and "::" not in str(entry_key):
+                entry_key = f"{server_key}::{entry_key}"
+            self.whitelist[str(entry_key)] = item
+
+    def _merge_cooldown(self, incoming, server_key: Optional[str] = None):
+        if not isinstance(incoming, dict):
+            return
+        for key, value in incoming.items():
+            self.cooldown[str(key)] = value
+
+    def _group_audit_records(self) -> Dict[str, Dict[str, List[Dict]]]:
+        grouped: Dict[str, Dict[str, List[Dict]]] = {}
+        for user_id, records in self.audit_records.items():
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                server_key = str(record.get("server_key") or "default")
+                grouped.setdefault(server_key, {}).setdefault(str(user_id), []).append(record)
+        return grouped
+
+    def _group_whitelist(self) -> Dict[str, Dict]:
+        grouped: Dict[str, Dict] = {}
+        for key, info in self.whitelist.items():
+            server_key = self._entry_server_key(key, info)
+            grouped.setdefault(server_key, {})[key] = info
+        return grouped
+
+    def _group_cooldown(self) -> Dict[str, Dict]:
+        grouped: Dict[str, Dict] = {}
+        for key, value in self.cooldown.items():
+            grouped.setdefault(self._cooldown_server_key(key), {})[key] = value
+        return grouped
+
+    def _cooldown_server_key(self, key: str) -> str:
+        text = str(key)
+        if "::" in text:
+            return text.split("::", 1)[0]
+        parts = text.split("_", 2)
+        return parts[1] if len(parts) >= 3 else "default"
+
+    def _server_data_files(self) -> Dict[str, Dict[str, str]]:
+        files = {}
+        if not self.plugin_manager or not hasattr(self.plugin_manager, "get_configured_servers"):
+            return files
+        for server in self.plugin_manager.get_configured_servers():
+            server_key = self._server_key(server)
+            files[server_key] = {
+                "audit_records": self._server_data_file(server_key, "audit_records.json"),
+                "whitelist": self._server_data_file(server_key, "whitelist.json"),
+                "cooldown": self._server_data_file(server_key, "cooldown.json"),
+            }
+        return files
+
+    def _server_data_file(self, server_key: str, filename: str) -> str:
+        if self.plugin_manager and hasattr(self.plugin_manager, "get_plugin_server_file_by_key"):
+            return str(self.plugin_manager.get_plugin_server_file_by_key(
+                "whitelist_audit", server_key, filename
+            ))
+        safe = self._safe_path_name(server_key)
+        path = os.path.join(self.DATA_DIR, "servers", safe)
+        os.makedirs(path, exist_ok=True)
+        return os.path.join(path, filename)
+
+    def _safe_path_name(self, value: str) -> str:
+        text = str(value or "default").replace("\\", "/").strip()
+        if "/" in text:
+            text = os.path.splitext(os.path.basename(text))[0]
+        safe = "".join(char if char.isalnum() or char in ("-", "_", ".") else "_" for char in text)
+        return safe.strip("._") or "default"
     
     def _save_audit_record(self, record: dict):
         """保存审核记录"""
@@ -1233,9 +1526,13 @@ class WhitelistAuditPlugin(BotPlugin):
         self.audit_records[user_id].append(record)
         self._save_data()
     
-    def _add_to_whitelist(self, game_id: str, user_id: int, group_id: int, admin: bool = False):
+    def _add_to_whitelist(self, game_id: str, user_id: int, group_id: int, admin: bool = False,
+                          target_server: Optional[Dict] = None, server_key: Optional[str] = None):
         """添加到白名单"""
-        self.whitelist[game_id] = {
+        server_key = server_key or self._server_key(target_server)
+        self.whitelist[self._whitelist_key(game_id, server_key=server_key)] = {
+            "game_id": game_id,
+            "server_key": server_key,
             "user_id": user_id,
             "group_id": group_id,
             "added_by": "admin" if admin else "audit",
@@ -1244,39 +1541,81 @@ class WhitelistAuditPlugin(BotPlugin):
         self._save_data()
         self.logger.info(f"游戏ID {game_id} 已添加到白名单")
     
-    def _set_cooldown(self, user_id: int, game_id: str):
+    def _set_cooldown(self, user_id: int, game_id: str, target_server: Optional[Dict] = None,
+                      server_key: Optional[str] = None, config: Optional[Dict] = None):
         """设置冷却时间"""
-        key = f"{user_id}_{game_id}"
-        self.cooldown[key] = time.time() + self.config["cooldown_seconds"]
+        active_config = config or self._config_for_server(target_server, server_key)
+        key = self._cooldown_key(user_id, game_id, target_server, server_key)
+        self.cooldown[key] = time.time() + active_config["cooldown_seconds"]
         self._save_data()
     
-    def _check_cooldown(self, user_id: int, game_id: str) -> int:
+    def _check_cooldown(self, user_id: int, game_id: str, target_server: Optional[Dict] = None,
+                        server_key: Optional[str] = None) -> int:
         """检查冷却时间"""
-        key = f"{user_id}_{game_id}"
-        if key in self.cooldown:
-            remaining = self.cooldown[key] - time.time()
+        key = self._cooldown_key(user_id, game_id, target_server, server_key)
+        legacy_key = self._legacy_cooldown_key(user_id, game_id, target_server, server_key)
+        active_key = key if key in self.cooldown else legacy_key if legacy_key in self.cooldown else key
+        if active_key in self.cooldown:
+            remaining = self.cooldown[active_key] - time.time()
             if remaining > 0:
                 return int(remaining)
             else:
-                del self.cooldown[key]
+                del self.cooldown[active_key]
                 self._save_data()
         return 0
+
+    def _cooldown_key(self, user_id: int, game_id: str, target_server: Optional[Dict] = None,
+                      server_key: Optional[str] = None) -> str:
+        target_key = self._server_key(target_server) if server_key is None else server_key
+        return f"{target_key}::{user_id}::{game_id}"
+
+    def _legacy_cooldown_key(self, user_id: int, game_id: str, target_server: Optional[Dict] = None,
+                             server_key: Optional[str] = None) -> str:
+        target_key = self._server_key(target_server) if server_key is None else server_key
+        return f"{user_id}_{target_key}_{game_id}"
     
-    def _is_in_whitelist(self, game_id: str) -> bool:
+    def _is_in_whitelist(self, game_id: str, target_server: Optional[Dict] = None,
+                         server_key: Optional[str] = None) -> bool:
         """检查是否在白名单中"""
-        return game_id in self.whitelist
+        return self._whitelist_key(game_id, target_server, server_key) in self.whitelist
     
-    def _get_user_whitelist_count(self, user_id: int) -> int:
+    def _get_user_whitelist_count(self, user_id: int, target_server: Optional[Dict] = None,
+                                  server_key: Optional[str] = None) -> int:
         """获取用户已绑定的白名单数量"""
+        expected_server_key = self._server_key(target_server) if server_key is None else server_key
         count = 0
-        for info in self.whitelist.values():
-            if info["user_id"] == user_id:
+        for key, info in self.whitelist.items():
+            if info["user_id"] == user_id and self._entry_server_key(key, info) == expected_server_key:
                 count += 1
         return count
     
-    def _is_group_allowed(self, group_id: int) -> bool:
+    def _is_group_allowed(self, group_id: int, target_server: Optional[Dict] = None) -> bool:
         """检查群组是否允许"""
-        return group_id in self.config["allowed_groups"]
+        qq_groups = ((target_server or {}).get("qq") or {}).get("groups") or []
+        if qq_groups:
+            return group_id in qq_groups
+        return group_id in self._config_for_server(target_server)["allowed_groups"]
+
+    def _server_key(self, target_server: Optional[Dict] = None) -> str:
+        target_server = target_server or {}
+        return str(target_server.get("_config_file") or target_server.get("name") or "default")
+
+    def _whitelist_key(self, game_id: str, target_server: Optional[Dict] = None,
+                       server_key: Optional[str] = None) -> str:
+        return f"{self._server_key(target_server) if server_key is None else server_key}::{game_id}"
+
+    def _audit_key(self, game_id: str, server_key: str) -> str:
+        return f"{server_key}::{game_id}"
+
+    def _entry_server_key(self, key: str, info: Dict) -> str:
+        if isinstance(info, dict) and info.get("server_key"):
+            return str(info.get("server_key"))
+        if "::" in str(key):
+            return str(key).split("::", 1)[0]
+        return "default"
+
+    def _session_key(self, user_id: int, group_id: int, target_server: Optional[Dict] = None) -> str:
+        return f"{user_id}_{group_id}_{self._server_key(target_server)}"
     
     def _is_valid_game_id(self, game_id: str) -> bool:
         """验证游戏ID格式"""
