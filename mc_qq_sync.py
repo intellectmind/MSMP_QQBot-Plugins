@@ -188,13 +188,14 @@ class MCQQSyncPlugin(BotPlugin):
                     await asyncio.sleep(5)
                     continue
                 
-                # 检查MC玩家消息（自动同步或主动发送功能）
-                active_config = self._config_for_server()
-                auto_enabled = active_config['features']['mc_auto_sync_to_qq']['enabled']
-                manual_enabled = active_config['features']['mc_manual_sync_to_qq']['enabled']
-                
-                if auto_enabled or manual_enabled:
-                    await self._check_server_logs()
+                # 检查每个运行中服务器的MC玩家消息，避免 active 切换导致跨服串日志。
+                for target_server in self._running_target_servers():
+                    active_config = self._config_for_server(target_server)
+                    auto_enabled = active_config['features']['mc_auto_sync_to_qq']['enabled']
+                    manual_enabled = active_config['features']['mc_manual_sync_to_qq']['enabled']
+
+                    if auto_enabled or manual_enabled:
+                        await self._check_server_logs(target_server)
                 
                 await asyncio.sleep(2)
             except asyncio.CancelledError:
@@ -207,14 +208,29 @@ class MCQQSyncPlugin(BotPlugin):
         """检查服务器运行状态"""
         try:
             if hasattr(self.plugin_manager, 'is_server_running'):
-                self._server_running = self.plugin_manager.is_server_running()
+                self._server_running = bool(self._running_target_servers())
             else:
                 self._server_running = True
         except Exception as e:
             self.logger.error(f"检查服务器状态失败: {e}")
             self._server_running = True
     
-    async def _check_server_logs(self):
+    def _running_target_servers(self) -> List[Dict[str, Any]]:
+        """返回当前需要轮询日志的运行中服务器列表。"""
+        if self.plugin_manager and hasattr(self.plugin_manager, 'get_running_server_configs'):
+            servers = self.plugin_manager.get_running_server_configs()
+            if servers:
+                return servers
+
+        active_server = self._active_target_server()
+        if self.plugin_manager and hasattr(self.plugin_manager, 'is_server_running'):
+            if active_server and self.plugin_manager.is_server_running(active_server):
+                return [active_server]
+            if self.plugin_manager.is_server_running():
+                return [active_server]
+        return [active_server] if active_server else []
+
+    async def _check_server_logs(self, target_server: Optional[Dict[str, Any]] = None):
         """检查服务器日志中的玩家消息"""
         try:
             self._cleanup_expired_cache()
@@ -222,19 +238,19 @@ class MCQQSyncPlugin(BotPlugin):
             if not self.plugin_manager:
                 return
             
-            logs = self.plugin_manager.get_server_logs(50)
+            logs = self.plugin_manager.get_server_logs(50, target_server)
             
             if not isinstance(logs, list) or not logs:
                 return
             
             for log_line in reversed(logs):
                 if isinstance(log_line, str):
-                    log_hash = self._get_log_hash(log_line)
+                    log_hash = self._get_log_hash(f"{self._server_key(target_server)}::{log_line}")
                     
                     if log_hash in self._processed_log_timestamps:
                         continue
                     
-                    processed = await self._process_player_message(log_line)
+                    processed = await self._process_player_message(log_line, target_server)
                     if processed:
                         self._processed_log_timestamps.add(log_hash)
             
@@ -275,7 +291,7 @@ class MCQQSyncPlugin(BotPlugin):
         except Exception as e:
             self.logger.error(f"清理消息缓存失败: {e}")
     
-    async def _process_player_message(self, log_line: str) -> bool:
+    async def _process_player_message(self, log_line: str, target_server: Optional[Dict[str, Any]] = None) -> bool:
         """处理玩家消息"""
         try:
             if '[Not Secure]' not in log_line:
@@ -293,7 +309,7 @@ class MCQQSyncPlugin(BotPlugin):
             self.logger.debug(f"捕获到玩家消息: {player_name} -> {message}")
             
             # 检查玩家是否在黑名单中
-            active_config = self._config_for_server()
+            active_config = self._config_for_server(target_server)
             if player_name in active_config['blacklist']['players']:
                 self.logger.debug(f"玩家 {player_name} 在黑名单中，跳过处理")
                 return False
@@ -311,18 +327,18 @@ class MCQQSyncPlugin(BotPlugin):
                     return False
                 
                 # 检查群列表是否为空
-                if not self._target_group_ids('mc_manual_sync_to_qq', config=active_config):
+                if not self._target_group_ids('mc_manual_sync_to_qq', target_server, active_config):
                     self.logger.debug("MC主动发送到QQ的群列表为空")
                     return False
                 
-                cache_key = f"{player_name}:qq:{qq_message}"
+                cache_key = f"{self._server_key(target_server)}:{player_name}:qq:{qq_message}"
                 if cache_key in self.message_cache:
                     self.logger.debug(f"消息缓存中已存在: {cache_key}，跳过处理")
                     return False
                 
                 self.message_cache[cache_key] = time.time()
                 self.logger.info(f"处理MC主动发送到QQ: {player_name} -> {qq_message}")
-                await self._forward_player_message_to_qq(player_name, qq_message, 'mc_manual_to_qq')
+                await self._forward_player_message_to_qq(player_name, qq_message, 'mc_manual_to_qq', target_server)
                 return True
             
             # 过滤其他命令
@@ -336,29 +352,35 @@ class MCQQSyncPlugin(BotPlugin):
                 return False
             
             # 检查群列表是否为空
-            if not self._target_group_ids('mc_auto_sync_to_qq', config=active_config):
+            if not self._target_group_ids('mc_auto_sync_to_qq', target_server, active_config):
                 self.logger.debug("MC自动同步到QQ的群列表为空")
                 return False
             
-            cache_key = f"{player_name}:{message}"
+            cache_key = f"{self._server_key(target_server)}:{player_name}:{message}"
             if cache_key in self.message_cache:
                 self.logger.debug(f"消息缓存中已存在: {cache_key}，跳过处理")
                 return False
             
             self.message_cache[cache_key] = time.time()
             self.logger.info(f"处理MC自动同步到QQ: {player_name} -> {message}")
-            await self._forward_player_message_to_qq(player_name, message, 'mc_auto_to_qq')
+            await self._forward_player_message_to_qq(player_name, message, 'mc_auto_to_qq', target_server)
             return True
             
         except Exception as e:
             self.logger.error(f"处理玩家消息失败: {e}", exc_info=True)
             return False
     
-    async def _forward_player_message_to_qq(self, player_name: str, message: str, msg_type: str = 'mc_auto_to_qq'):
+    async def _forward_player_message_to_qq(
+        self,
+        player_name: str,
+        message: str,
+        msg_type: str = 'mc_auto_to_qq',
+        target_server: Optional[Dict[str, Any]] = None
+    ):
         """将玩家消息转发到QQ群"""
         try:
             # 根据消息类型确定功能和群列表
-            active_config = self._config_for_server()
+            active_config = self._config_for_server(target_server)
             if msg_type == 'mc_auto_to_qq':
                 feature_config = active_config['features']['mc_auto_sync_to_qq']
             elif msg_type == 'mc_manual_to_qq':
@@ -371,6 +393,7 @@ class MCQQSyncPlugin(BotPlugin):
             
             group_ids = self._target_group_ids(
                 'mc_auto_sync_to_qq' if msg_type == 'mc_auto_to_qq' else 'mc_manual_sync_to_qq',
+                target_server,
                 config=active_config
             )
             if not group_ids:

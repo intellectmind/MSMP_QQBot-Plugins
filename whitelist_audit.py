@@ -93,7 +93,10 @@ class WhitelistAuditPlugin(BotPlugin):
             
             # 保存 QQBotServer 引用以便后续获取 RCON 客户端
             self.qq_bot_server = None
-            if hasattr(plugin_manager, 'qq_bot_server'):
+            if hasattr(plugin_manager, 'qq_server'):
+                self.qq_bot_server = plugin_manager.qq_server
+                self.logger.info("已获取 QQBotServer 引用")
+            elif hasattr(plugin_manager, 'qq_bot_server'):
                 self.qq_bot_server = plugin_manager.qq_bot_server
                 self.logger.info("已获取 QQBotServer 引用")
 

@@ -184,7 +184,7 @@ class QQMCBindingPlugin(BotPlugin):
         try:
             # 使用插件管理器提供的API检查服务器状态
             if hasattr(self.plugin_manager, 'is_server_running'):
-                self._server_running = self.plugin_manager.is_server_running()
+                self._server_running = bool(self._running_target_servers())
             else:
                 # 如果API不可用，记录警告但继续运行
                 self._server_running = True
@@ -222,7 +222,8 @@ class QQMCBindingPlugin(BotPlugin):
                     await asyncio.sleep(5)
                     continue
                     
-                await self._check_server_logs()
+                for target_server in self._running_target_servers():
+                    await self._check_server_logs(target_server)
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
                 break
@@ -230,7 +231,7 @@ class QQMCBindingPlugin(BotPlugin):
                 self.logger.error(f"日志轮询出错: {e}")
                 await asyncio.sleep(5)
     
-    async def _check_server_logs(self):
+    async def _check_server_logs(self, target_server: Optional[Dict[str, Any]] = None):
         """检查服务器日志中的玩家消息"""
         try:
             self._cleanup_expired_verify_codes()
@@ -239,7 +240,7 @@ class QQMCBindingPlugin(BotPlugin):
                 return
                 
             # 获取服务器日志
-            logs = self.plugin_manager.get_server_logs(50)
+            logs = self.plugin_manager.get_server_logs(50, target_server)
             
             # 确保 logs 是列表
             if not isinstance(logs, list):
@@ -255,14 +256,14 @@ class QQMCBindingPlugin(BotPlugin):
                 log_line = logs[i]
                 if isinstance(log_line, str):
                     # 生成日志的唯一标识（使用时间戳）
-                    log_hash = self._get_log_hash(log_line)
+                    log_hash = self._get_log_hash(f"{self._server_key(target_server)}::{log_line}")
                     
                     # 如果已经处理过，跳过
                     if log_hash in self._processed_log_timestamps:
                         continue
                     
                     # 处理日志
-                    processed = await self._process_log_line(log_line)
+                    processed = await self._process_log_line(log_line, target_server)
                     if processed:
                         new_logs_processed += 1
                         # 记录已处理的日志
@@ -285,6 +286,21 @@ class QQMCBindingPlugin(BotPlugin):
             # 如果哈希失败，使用原始字符串（简单场景下也够用）
             return log_line
 
+    def _running_target_servers(self) -> List[Dict[str, Any]]:
+        """返回当前需要轮询日志的运行中服务器列表。"""
+        if self.plugin_manager and hasattr(self.plugin_manager, 'get_running_server_configs'):
+            servers = self.plugin_manager.get_running_server_configs()
+            if servers:
+                return servers
+
+        active_server = self._active_target_server()
+        if self.plugin_manager and hasattr(self.plugin_manager, 'is_server_running'):
+            if active_server and self.plugin_manager.is_server_running(active_server):
+                return [active_server]
+            if self.plugin_manager.is_server_running():
+                return [active_server]
+        return [active_server] if active_server else []
+
     def _cleanup_processed_logs_cache(self):
         """清理已处理日志缓存，避免内存无限增长"""
         try:
@@ -300,7 +316,7 @@ class QQMCBindingPlugin(BotPlugin):
         except Exception as e:
             self.logger.error(f"清理日志缓存失败: {e}")
 
-    async def _process_log_line(self, log_line: str) -> bool:
+    async def _process_log_line(self, log_line: str, target_server: Optional[Dict[str, Any]] = None) -> bool:
         """处理单条日志行，返回是否处理了消息"""
         try:
             import re
@@ -329,17 +345,22 @@ class QQMCBindingPlugin(BotPlugin):
                 return False
             
             # 处理验证码
-            await self._process_verify_code(verify_code, player_name)
+            await self._process_verify_code(verify_code, player_name, target_server)
             return True
             
         except Exception as e:
             self.logger.error(f"处理日志行失败: {e}")
             return False
     
-    async def _process_verify_code(self, verify_code: str, player_name: str):
+    async def _process_verify_code(
+        self,
+        verify_code: str,
+        player_name: str,
+        target_server: Optional[Dict[str, Any]] = None
+    ):
         """处理验证码"""
         try:
-            verify_key = self._resolve_verify_key(verify_code)
+            verify_key = self._resolve_verify_key(verify_code, target_server)
             # 检查验证码是否存在且有效
             if not verify_key:
                 self.logger.warning(f"玩家 {player_name} 使用无效验证码: {verify_code}")
@@ -621,11 +642,16 @@ class QQMCBindingPlugin(BotPlugin):
         text = str(storage_key)
         return text.rsplit("::", 1)[-1] if "::" in text else text
 
-    def _resolve_verify_key(self, verify_code: str) -> Optional[str]:
+    def _resolve_verify_key(self, verify_code: str, target_server: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """按服务器优先解析验证码，避免多服务器相同验证码串服。"""
-        active_key = self._server_key(self._active_target_server())
-        preferred = self._verify_storage_key(active_key, verify_code)
-        if preferred in self.pending_verify:
+        preferred_key = self._server_key(target_server or self._active_target_server())
+        preferred = self._verify_storage_key(preferred_key, verify_code)
+        preferred_info = self.pending_verify.get(preferred)
+        if (
+            preferred_info
+            and not preferred_info.get('used', False)
+            and time.time() <= preferred_info.get('expire_time', 0)
+        ):
             return preferred
 
         matches = [

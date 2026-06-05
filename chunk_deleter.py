@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import os
 import shutil
 import re
@@ -47,10 +48,13 @@ class ChunkDeleterPlugin(BotPlugin):
         self.config = self.DEFAULT_CONFIG.copy()
         self.operation_history: List[Dict] = []
         self.user_cooldowns: Dict[int, float] = {}
-        self.pending_confirmations: Dict[int, Dict] = {}
+        self.pending_confirmations: Dict[str, Dict] = {}
         self.server_working_directory = ""
         self.server_type = "unknown"
-        self._confirmation_tasks: Dict[int, asyncio.Task] = {}
+        self.server_contexts: Dict[str, Dict[str, str]] = {}
+        self._active_working_directory = contextvars.ContextVar("chunk_deleter_working_directory", default="")
+        self._active_server_type = contextvars.ContextVar("chunk_deleter_server_type", default="unknown")
+        self._confirmation_tasks: Dict[str, asyncio.Task] = {}
     
     async def on_load(self, plugin_manager) -> bool:
         """插件加载时的初始化"""
@@ -171,8 +175,9 @@ class ChunkDeleterPlugin(BotPlugin):
                                  config_manager=None, **kwargs) -> Optional[str]:
         """处理单个区块删除命令"""
         try:
+            target_server = kwargs.get("target_server")
             # 检查服务器目录
-            if not await self._ensure_server_detected(config_manager):
+            if not await self._ensure_server_detected(config_manager, target_server):
                 return "请先配置服务器工作目录"
             
             # 解析命令参数
@@ -180,7 +185,7 @@ class ChunkDeleterPlugin(BotPlugin):
             
             # 处理确认操作
             if parts and parts[0].lower() == "confirm":
-                return await self._confirm_operation(user_id, group_id)
+                return await self._confirm_operation(user_id, group_id, target_server)
             
             # 解析坐标和维度
             if len(parts) < 2:
@@ -228,7 +233,7 @@ class ChunkDeleterPlugin(BotPlugin):
             
             # 如果需要确认
             if self.config["require_confirmation"]:
-                return await self._request_single_confirmation(user_id, x, z, dimension, coord_type)
+                return await self._request_single_confirmation(user_id, group_id, x, z, dimension, coord_type, target_server)
             
             # 直接执行删除
             return await self._execute_chunk_deletion(user_id, x, z, dimension, "single", coord_type)
@@ -238,11 +243,12 @@ class ChunkDeleterPlugin(BotPlugin):
             return f"命令执行失败: {str(e)}"
     
     async def handle_delete_chunk_area(self, user_id: int, group_id: int, command_text: str,
-                                      config_manager=None, **kwargs) -> Optional[str]:
+                                     config_manager=None, **kwargs) -> Optional[str]:
         """处理区域区块删除命令"""
         try:
+            target_server = kwargs.get("target_server")
             # 检查服务器目录
-            if not await self._ensure_server_detected(config_manager):
+            if not await self._ensure_server_detected(config_manager, target_server):
                 return "请先配置服务器工作目录"
             
             # 解析命令参数
@@ -306,7 +312,7 @@ class ChunkDeleterPlugin(BotPlugin):
             
             # 如果需要确认
             if self.config["require_confirmation"]:
-                return await self._request_area_confirmation(user_id, x1, z1, x2, z2, dimension, chunk_count, coord_type)
+                return await self._request_area_confirmation(user_id, group_id, x1, z1, x2, z2, dimension, chunk_count, coord_type, target_server)
             
             # 直接执行删除
             return await self._execute_area_deletion(user_id, x1, z1, x2, z2, dimension, chunk_count, coord_type)
@@ -316,11 +322,12 @@ class ChunkDeleterPlugin(BotPlugin):
             return f"命令执行失败: {str(e)}"
     
     async def handle_restore_chunk(self, user_id: int, group_id: int, command_text: str,
-                                  config_manager=None, **kwargs) -> Optional[str]:
+                                 config_manager=None, **kwargs) -> Optional[str]:
         """处理还原区块命令"""
         try:
+            target_server = kwargs.get("target_server")
             # 检查服务器目录
-            if not await self._ensure_server_detected(config_manager):
+            if not await self._ensure_server_detected(config_manager, target_server):
                 return "请先配置服务器工作目录"
             
             # 解析命令参数
@@ -361,8 +368,9 @@ class ChunkDeleterPlugin(BotPlugin):
                                  config_manager=None, **kwargs) -> Optional[str]:
         """处理手动备份区块命令"""
         try:
+            target_server = kwargs.get("target_server")
             # 检查服务器目录
-            if not await self._ensure_server_detected(config_manager):
+            if not await self._ensure_server_detected(config_manager, target_server):
                 return "请先配置服务器工作目录"
             
             # 解析命令参数
@@ -399,24 +407,33 @@ class ChunkDeleterPlugin(BotPlugin):
             self.logger.error(f"处理备份区块命令失败: {e}", exc_info=True)
             return f"命令执行失败: {str(e)}"
     
-    async def _request_single_confirmation(self, user_id: int, x: int, z: int, dimension: str, coord_type: str) -> str:
+    async def _request_single_confirmation(self, user_id: int, group_id: int, x: int, z: int,
+                                           dimension: str, coord_type: str, target_server=None) -> str:
         """请求单个区块删除确认"""
         timeout = self.config["confirmation_timeout"]
         coord_display = f"世界坐标({x*16}, {z*16})" if coord_type == "world" else f"区块坐标({x}, {z})"
+        server_key = self._server_key(target_server)
+        confirmation_key = self._confirmation_key(user_id, group_id, server_key)
+        working_dir = self._current_working_directory()
+        server_type = self._current_server_type()
         
         confirm_msg = (
             f"确认删除区块文件和POI文件?\n"
             f"坐标: {coord_display}\n"
             f"维度: {dimension}\n"
-            f"服务器类型: {self.server_type}\n"
+            f"服务器类型: {server_type}\n"
             f"输入: delete_chunk confirm 确认删除\n"
             f"注意: 此操作不可逆，请确保服务器已停止!\n"
             f"请在 {timeout} 秒内确认，超时自动取消"
         )
         
         # 保存待确认的操作
-        self.pending_confirmations[user_id] = {
+        self.pending_confirmations[confirmation_key] = {
             "user_id": user_id,
+            "group_id": group_id,
+            "server_key": server_key,
+            "server_working_directory": working_dir,
+            "server_type": server_type,
             "coordinates": (x, z),
             "dimension": dimension,
             "coord_type": coord_type,
@@ -426,31 +443,39 @@ class ChunkDeleterPlugin(BotPlugin):
         }
         
         # 创建超时任务
-        self._create_confirmation_timeout_task(user_id, timeout)
+        self._create_confirmation_timeout_task(confirmation_key, timeout)
         
         return confirm_msg
     
-    async def _request_area_confirmation(self, user_id: int, x1: int, z1: int, x2: int, z2: int, 
-                                       dimension: str, chunk_count: int, coord_type: str) -> str:
+    async def _request_area_confirmation(self, user_id: int, group_id: int, x1: int, z1: int, x2: int, z2: int,
+                                         dimension: str, chunk_count: int, coord_type: str, target_server=None) -> str:
         """请求区域区块删除确认"""
         timeout = self.config["confirmation_timeout"]
         coord_display1 = f"世界坐标({x1*16}, {z1*16})" if coord_type == "world" else f"区块坐标({x1}, {z1})"
         coord_display2 = f"世界坐标({x2*16}, {z2*16})" if coord_type == "world" else f"区块坐标({x2}, {z2})"
+        server_key = self._server_key(target_server)
+        confirmation_key = self._confirmation_key(user_id, group_id, server_key)
+        working_dir = self._current_working_directory()
+        server_type = self._current_server_type()
         
         confirm_msg = (
             f"确认删除区域内的所有区块文件和POI文件?\n"
             f"区域: {coord_display1} 到 {coord_display2}\n"
             f"维度: {dimension}\n"
             f"区块数量: {chunk_count}\n"
-            f"服务器类型: {self.server_type}\n"
+            f"服务器类型: {server_type}\n"
             f"输入: delete_chunk confirm 确认删除\n"
             f"注意: 此操作不可逆，请确保服务器已停止!\n"
             f"请在 {timeout} 秒内确认，超时自动取消"
         )
         
         # 保存待确认的操作
-        self.pending_confirmations[user_id] = {
+        self.pending_confirmations[confirmation_key] = {
             "user_id": user_id,
+            "group_id": group_id,
+            "server_key": server_key,
+            "server_working_directory": working_dir,
+            "server_type": server_type,
             "coordinates": (x1, z1, x2, z2),
             "dimension": dimension,
             "coord_type": coord_type,
@@ -460,30 +485,30 @@ class ChunkDeleterPlugin(BotPlugin):
         }
         
         # 创建超时任务
-        self._create_confirmation_timeout_task(user_id, timeout)
+        self._create_confirmation_timeout_task(confirmation_key, timeout)
         
         return confirm_msg
     
-    def _create_confirmation_timeout_task(self, user_id: int, timeout: int):
+    def _create_confirmation_timeout_task(self, confirmation_key: str, timeout: int):
         """创建确认超时任务"""
         # 取消现有的任务
-        if user_id in self._confirmation_tasks:
-            self._confirmation_tasks[user_id].cancel()
+        if confirmation_key in self._confirmation_tasks:
+            self._confirmation_tasks[confirmation_key].cancel()
         
         # 创建新任务
-        task = asyncio.create_task(self._handle_confirmation_timeout(user_id, timeout))
-        self._confirmation_tasks[user_id] = task
+        task = asyncio.create_task(self._handle_confirmation_timeout(confirmation_key, timeout))
+        self._confirmation_tasks[confirmation_key] = task
     
-    async def _handle_confirmation_timeout(self, user_id: int, timeout: int):
+    async def _handle_confirmation_timeout(self, confirmation_key: str, timeout: int):
         """处理确认超时"""
         try:
             await asyncio.sleep(timeout)
             
-            if user_id in self.pending_confirmations:
-                operation = self.pending_confirmations.pop(user_id)
-                if user_id in self._confirmation_tasks:
-                    self._confirmation_tasks.pop(user_id)
-                self.logger.info(f"用户 {user_id} 的区块删除操作已超时取消: {operation}")
+            if confirmation_key in self.pending_confirmations:
+                operation = self.pending_confirmations.pop(confirmation_key)
+                if confirmation_key in self._confirmation_tasks:
+                    self._confirmation_tasks.pop(confirmation_key)
+                self.logger.info(f"区块删除操作已超时取消 {confirmation_key}: {operation}")
                 
         except asyncio.Cancelled:
             # 任务被取消是正常情况
@@ -491,18 +516,23 @@ class ChunkDeleterPlugin(BotPlugin):
         except Exception as e:
             self.logger.error(f"处理确认超时失败: {e}", exc_info=True)
     
-    async def _confirm_operation(self, user_id: int, group_id: int) -> str:
+    async def _confirm_operation(self, user_id: int, group_id: int, target_server=None) -> str:
         """确认并执行待处理的操作"""
         try:
-            if user_id not in self.pending_confirmations:
+            confirmation_key = self._confirmation_key(user_id, group_id, self._server_key(target_server))
+            if confirmation_key not in self.pending_confirmations:
                 return "没有待确认的区块删除操作"
             
-            operation = self.pending_confirmations.pop(user_id)
+            operation = self.pending_confirmations.pop(confirmation_key)
             
             # 取消超时任务
-            if user_id in self._confirmation_tasks:
-                self._confirmation_tasks[user_id].cancel()
-                self._confirmation_tasks.pop(user_id)
+            if confirmation_key in self._confirmation_tasks:
+                self._confirmation_tasks[confirmation_key].cancel()
+                self._confirmation_tasks.pop(confirmation_key)
+            self._set_current_server_context(
+                operation.get("server_working_directory", ""),
+                operation.get("server_type", "unknown")
+            )
             
             if operation["type"] == "single":
                 x, z = operation["coordinates"]
@@ -883,7 +913,7 @@ class ChunkDeleterPlugin(BotPlugin):
     async def _get_backup_file_path(self, dimension: str, x: int, z: int, file_type: str) -> Optional[str]:
         """获取备份文件路径"""
         try:
-            backup_dir = os.path.join(self.server_working_directory, "chunk_backups", dimension, file_type)
+            backup_dir = os.path.join(self._current_working_directory(), "chunk_backups", dimension, file_type)
             if not os.path.exists(backup_dir):
                 return None
             
@@ -917,19 +947,42 @@ class ChunkDeleterPlugin(BotPlugin):
             return "modded"
         
         return "vanilla"
+
+    def _server_key(self, target_server=None) -> str:
+        target_server = target_server or {}
+        return str(target_server.get("_config_file") or target_server.get("name") or "default")
+
+    def _confirmation_key(self, user_id: int, group_id: int, server_key: str) -> str:
+        return f"{server_key}::{group_id}::{user_id}"
+
+    def _set_current_server_context(self, working_dir: str, server_type: str):
+        working_dir = str(working_dir or "")
+        server_type = str(server_type or "unknown")
+        self._active_working_directory.set(working_dir)
+        self._active_server_type.set(server_type)
+        # 保留旧字段，兼容日志和可能的外部调试读取。
+        self.server_working_directory = working_dir
+        self.server_type = server_type
+
+    def _current_working_directory(self) -> str:
+        return self._active_working_directory.get() or self.server_working_directory
+
+    def _current_server_type(self) -> str:
+        return self._active_server_type.get() or self.server_type or "unknown"
     
     def _get_world_path(self, dimension: str) -> Optional[str]:
         """获取世界文件夹完整路径"""
-        if not self.server_working_directory:
+        working_dir = self._current_working_directory()
+        if not working_dir:
             return None
         
-        structure = self.SERVER_WORLD_STRUCTURES.get(self.server_type, {})
+        structure = self.SERVER_WORLD_STRUCTURES.get(self._current_server_type(), {})
         world_relative_path = structure.get(dimension)
         
         if not world_relative_path:
             return None
         
-        return os.path.join(self.server_working_directory, world_relative_path)
+        return os.path.join(working_dir, world_relative_path)
     
     def _get_chunk_file_path(self, world_path: str, chunk_x: int, chunk_z: int) -> str:
         """获取区块文件路径"""
@@ -955,7 +1008,7 @@ class ChunkDeleterPlugin(BotPlugin):
         """备份区块文件或POI文件"""
         try:
             # 根据文件类型创建不同的备份文件夹
-            backup_dir = os.path.join(self.server_working_directory, "chunk_backups", dimension, file_type)
+            backup_dir = os.path.join(self._current_working_directory(), "chunk_backups", dimension, file_type)
             os.makedirs(backup_dir, exist_ok=True)
             
             # 使用原文件名加上 .backup 后缀
@@ -972,44 +1025,65 @@ class ChunkDeleterPlugin(BotPlugin):
             self.logger.warning(f"备份{file_type}文件失败 {chunk_file}: {e}")
             return ""
     
-    async def _ensure_server_detected(self, config_manager) -> bool:
+    async def _ensure_server_detected(self, config_manager, target_server=None) -> bool:
         """确保服务器已检测"""
-        if not self.server_working_directory and config_manager:
+        server_key = self._server_key(target_server)
+        cached = self.server_contexts.get(server_key) or {}
+        if cached.get("working_directory") and os.path.exists(cached["working_directory"]):
+            self._set_current_server_context(cached["working_directory"], cached.get("server_type", "unknown"))
+            return True
+
+        if config_manager:
             # 自动检测服务器
-            working_dir = config_manager.get_server_working_directory()
-            start_script = config_manager.get_server_start_script()
+            working_dir = config_manager.get_server_working_directory(target_server)
+            start_script = config_manager.get_server_start_script(target_server)
             
             if not working_dir and start_script:
                 working_dir = os.path.dirname(start_script)
             
             if working_dir and os.path.exists(working_dir):
-                self.server_working_directory = working_dir
-                self.server_type = self._detect_server_type(working_dir)
+                server_type = self._detect_server_type(working_dir)
+                self.server_contexts[server_key] = {
+                    "working_directory": working_dir,
+                    "server_type": server_type,
+                }
+                self._set_current_server_context(working_dir, server_type)
                 return True
         
-        return bool(self.server_working_directory)
+        return bool(self._current_working_directory())
     
     def _get_current_time(self) -> str:
         """获取当前时间字符串"""
         from datetime import datetime
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    async def on_server_started(self) -> None:
+    def _clear_confirmations(self, server_key: Optional[str] = None):
+        if not server_key:
+            for task in self._confirmation_tasks.values():
+                task.cancel()
+            self._confirmation_tasks.clear()
+            self.pending_confirmations.clear()
+            return
+
+        prefix = f"{server_key}::"
+        keys = [key for key in self.pending_confirmations if str(key).startswith(prefix)]
+        for key in keys:
+            self.pending_confirmations.pop(key, None)
+            task = self._confirmation_tasks.pop(key, None)
+            if task:
+                task.cancel()
+
+    async def on_server_started(self, target_server=None, **kwargs) -> None:
         """服务器启动事件处理"""
-        self.logger.info("服务器已启动，区块删除插件就绪")
-        # 清理所有待确认操作
-        self.pending_confirmations.clear()
-        for task in self._confirmation_tasks.values():
-            task.cancel()
-        self._confirmation_tasks.clear()
+        server_key = self._server_key(target_server)
+        self.logger.info(f"{server_key} 服务器已启动，区块删除插件就绪")
+        self._clear_confirmations(server_key)
     
-    async def on_server_stopping(self) -> None:
+    async def on_server_stopping(self, target_server=None, **kwargs) -> None:
         """服务器停止事件处理"""
-        self.logger.info("服务器正在停止，清理区块删除插件状态")
-        self.pending_confirmations.clear()
-        for task in self._confirmation_tasks.values():
-            task.cancel()
-        self._confirmation_tasks.clear()
+        server_key = self._server_key(target_server)
+        self.logger.info(f"{server_key} 服务器正在停止，清理区块删除插件状态")
+        self._clear_confirmations(server_key)
     
     def get_plugin_help(self) -> str:
         """返回插件帮助信息"""
