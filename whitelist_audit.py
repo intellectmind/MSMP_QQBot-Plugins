@@ -817,6 +817,7 @@ class WhitelistAuditPlugin(BotPlugin):
             target_server = kwargs.get('target_server')
             server_key = self._server_key(target_server)
             active_config = self._config_for_server(target_server)
+            rcon_client = kwargs.get('target_rcon_client') or rcon_client or kwargs.get('rcon_client')
             parts = command_text.strip().split()
             if not parts:
                 return "子命令: add <游戏ID> | remove <游戏ID> | clear | reload | sessions | reset <用户ID> | sync | config | set_max <QQ号> <数量> | set_command <类型> <指令>"
@@ -1347,22 +1348,15 @@ class WhitelistAuditPlugin(BotPlugin):
         return self.config
     
     def _load_data(self):
-        """加载数据"""
         """加载全局旧数据和每服务器独立数据。"""
         self.audit_records = {}
         self.whitelist = {}
         self.cooldown = {}
 
         server_files = self._server_data_files()
-        has_server_data = any(
-            os.path.exists(path)
-            for paths in server_files.values()
-            for path in paths.values()
-        )
-        if not has_server_data:
-            self._merge_audit_records(self._read_json_file(self.AUDIT_RECORDS_FILE))
-            self._merge_whitelist(self._read_json_file(self.WHITELIST_FILE))
-            self._merge_cooldown(self._read_json_file(self.COOLDOWN_FILE))
+        self._merge_audit_records(self._read_json_file(self.AUDIT_RECORDS_FILE))
+        self._merge_whitelist(self._read_json_file(self.WHITELIST_FILE))
+        self._merge_cooldown(self._read_json_file(self.COOLDOWN_FILE))
 
         for server_key, paths in server_files.items():
             self._merge_audit_records(self._read_json_file(paths["audit_records"]), server_key)

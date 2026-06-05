@@ -29,8 +29,10 @@ class MCQQSyncPlugin(BotPlugin):
         },
         'qq_commands': {'mc_command_prefix': 'mc'},
         'mc_commands': {'qq_command_prefix': 'qq'},
-        'blacklist': {'players': [], 'users': []}
+        'blacklist': {'players': [], 'users': []},
+        'chat_message_pattern': r'.*(?:\[Not Secure\]\s*)?<([^>]+)>\s*(.+)'
     }
+    FLEXIBLE_CHAT_MESSAGE_PATTERN = r'.*(?:\[Not Secure\]\s*)?<([^>]+)>\s*(.+)'
     
     def __init__(self, logger):
         super().__init__(logger)
@@ -56,9 +58,10 @@ class MCQQSyncPlugin(BotPlugin):
         self._running = False
         self._server_running = False
         self._processed_log_timestamps = set()
+        self._seeded_log_sources = set()
         
         # 聊天消息匹配模式
-        self.chat_message_pattern = r'.*\[Not Secure\]\s*<([^>]+)>\s*(.+)'
+        self.chat_message_pattern = self.FLEXIBLE_CHAT_MESSAGE_PATTERN
     
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件，不存在则创建默认配置"""
@@ -110,7 +113,7 @@ class MCQQSyncPlugin(BotPlugin):
             plugin_manager.register_command(
                 command_name="mc_message",
                 handler=self.handle_mc_command,
-                names=[self.config['qq_commands']['mc_command_prefix']],
+                names=self._qq_command_names(),
                 description="发送消息到MC服务器",
                 usage=f"{self.config['qq_commands']['mc_command_prefix']} <消息内容>"
             )
@@ -157,8 +160,9 @@ class MCQQSyncPlugin(BotPlugin):
         try:
             if 'mc_qq_sync' in new_config:
                 new_plugin_config = new_config['mc_qq_sync']
-                self.config.update(new_plugin_config)
+                self.config = self._deep_merge(self.config, new_plugin_config)
                 self._save_config()
+                self._refresh_mc_command_aliases()
                 self.logger.info("插件配置已更新")
         except Exception as e:
             self.logger.error(f"配置更新失败: {e}")
@@ -238,14 +242,29 @@ class MCQQSyncPlugin(BotPlugin):
             if not self.plugin_manager:
                 return
             
-            logs = self.plugin_manager.get_server_logs(50, target_server)
+            if hasattr(self.plugin_manager, 'get_incremental_server_logs'):
+                logs = self.plugin_manager.get_incremental_server_logs(
+                    "mc_qq_sync",
+                    1000,
+                    target_server
+                )
+            else:
+                logs = self.plugin_manager.get_server_logs(200, target_server)
             
             if not isinstance(logs, list) or not logs:
+                return
+
+            server_key = self._server_key(target_server)
+            if self._should_seed_log_source(target_server, server_key):
+                for log_line in logs:
+                    if isinstance(log_line, str):
+                        self._processed_log_timestamps.add(self._get_log_hash(f"{server_key}::{log_line}"))
+                self._seeded_log_sources.add(server_key)
                 return
             
             for log_line in reversed(logs):
                 if isinstance(log_line, str):
-                    log_hash = self._get_log_hash(f"{self._server_key(target_server)}::{log_line}")
+                    log_hash = self._get_log_hash(f"{server_key}::{log_line}")
                     
                     if log_hash in self._processed_log_timestamps:
                         continue
@@ -270,13 +289,23 @@ class MCQQSyncPlugin(BotPlugin):
     def _cleanup_processed_logs_cache(self):
         """清理已处理日志缓存"""
         try:
-            if len(self._processed_log_timestamps) > 200:
+            if len(self._processed_log_timestamps) > 5000:
                 timestamps_list = list(self._processed_log_timestamps)
                 remove_count = len(timestamps_list) // 2
                 for i in range(remove_count):
                     self._processed_log_timestamps.discard(timestamps_list[i])
         except Exception as e:
             self.logger.error(f"清理日志缓存失败: {e}")
+
+    def _should_seed_log_source(self, target_server: Optional[Dict[str, Any]], server_key: str) -> bool:
+        if server_key in self._seeded_log_sources:
+            return False
+        if not self.plugin_manager or not hasattr(self.plugin_manager, 'is_server_running'):
+            return False
+        try:
+            return not self.plugin_manager.is_server_running(target_server)
+        except Exception:
+            return False
     
     def _cleanup_expired_cache(self):
         """清理过期的消息缓存"""
@@ -294,11 +323,16 @@ class MCQQSyncPlugin(BotPlugin):
     async def _process_player_message(self, log_line: str, target_server: Optional[Dict[str, Any]] = None) -> bool:
         """处理玩家消息"""
         try:
-            if '[Not Secure]' not in log_line:
+            if '<' not in log_line or '>' not in log_line:
                 return False
-            
-            pattern = self.chat_message_pattern
-            match = re.search(pattern, log_line)
+
+            active_config = self._config_for_server(target_server)
+            configured_pattern = active_config.get('chat_message_pattern') or self.chat_message_pattern
+            match = None
+            for pattern in dict.fromkeys([configured_pattern, self.FLEXIBLE_CHAT_MESSAGE_PATTERN]):
+                match = re.search(pattern, log_line)
+                if match:
+                    break
             
             if not match:
                 return False
@@ -309,16 +343,17 @@ class MCQQSyncPlugin(BotPlugin):
             self.logger.debug(f"捕获到玩家消息: {player_name} -> {message}")
             
             # 检查玩家是否在黑名单中
-            active_config = self._config_for_server(target_server)
             if player_name in active_config['blacklist']['players']:
                 self.logger.debug(f"玩家 {player_name} 在黑名单中，跳过处理")
                 return False
             
-            # 检查是否是 qq 命令（主动发送消息到QQ）
-            if message.startswith('qq '):
-                qq_message = message[3:].strip()
+            qq_prefix = str(active_config['mc_commands'].get('qq_command_prefix') or 'qq').strip()
+            qq_command = f"{qq_prefix} "
+            # 检查是否是 MC 内主动发送到 QQ 的命令。
+            if message.startswith(qq_command):
+                qq_message = message[len(qq_prefix):].strip()
                 if not qq_message:
-                    self.logger.debug(f"玩家 {player_name} 的qq命令消息为空，跳过处理")
+                    self.logger.debug(f"玩家 {player_name} 的{qq_prefix}命令消息为空，跳过处理")
                     return False
                 
                 # 检查主动发送到QQ功能是否启用
@@ -331,7 +366,7 @@ class MCQQSyncPlugin(BotPlugin):
                     self.logger.debug("MC主动发送到QQ的群列表为空")
                     return False
                 
-                cache_key = f"{self._server_key(target_server)}:{player_name}:qq:{qq_message}"
+                cache_key = f"{self._server_key(target_server)}:{player_name}:{qq_prefix}:{qq_message}"
                 if cache_key in self.message_cache:
                     self.logger.debug(f"消息缓存中已存在: {cache_key}，跳过处理")
                     return False
@@ -341,8 +376,9 @@ class MCQQSyncPlugin(BotPlugin):
                 await self._forward_player_message_to_qq(player_name, qq_message, 'mc_manual_to_qq', target_server)
                 return True
             
+            mc_prefix = str(active_config['qq_commands'].get('mc_command_prefix') or 'mc').strip()
             # 过滤其他命令
-            if message.startswith('/') or message.startswith('mc '):
+            if message.startswith('/') or message.startswith(f'{mc_prefix} '):
                 self.logger.debug(f"玩家 {player_name} 发送了命令，跳过处理: {message}")
                 return False
             
@@ -484,11 +520,13 @@ class MCQQSyncPlugin(BotPlugin):
             
             # 发送到MC
             self.logger.debug(f"正在发送消息到MC: {formatted_message}")
-            await self._send_message_to_mc(
+            sent = await self._send_message_to_mc(
                 formatted_message,
                 rcon_client=kwargs.get('target_rcon_client') or kwargs.get('rcon_client'),
                 target_server=target_server
             )
+            if not sent:
+                return f"[CQ:at,qq={user_id}] 发送失败：目标MC服务器未连接或不可写入"
             
             self.logger.info(f"QQ {user_id}({qq_nickname}) 发送消息到MC: {message}")
             return f"[CQ:at,qq={user_id}] 消息已发送到MC服务器"
@@ -530,6 +568,29 @@ class MCQQSyncPlugin(BotPlugin):
         if self.qq_mc_binding_plugin and hasattr(self.qq_mc_binding_plugin, '_binding_server_key'):
             return self.qq_mc_binding_plugin._binding_server_key(binding)
         return str((binding or {}).get('server_key') or (binding or {}).get('server') or 'default')
+
+    def _qq_command_names(self) -> List[str]:
+        """收集全局和每服务器配置中的 QQ->MC 命令前缀。"""
+        names = {str(self.config['qq_commands'].get('mc_command_prefix') or 'mc').strip() or 'mc', 'mc'}
+        if self.plugin_manager and hasattr(self.plugin_manager, 'get_configured_servers'):
+            for server in self.plugin_manager.get_configured_servers():
+                try:
+                    prefix = self._config_for_server(server)['qq_commands'].get('mc_command_prefix')
+                    if prefix:
+                        names.add(str(prefix).strip().lower())
+                except Exception as e:
+                    self.logger.debug(f"读取服务器 MC 同步命令前缀失败: {e}")
+        return sorted(names)
+
+    def _refresh_mc_command_aliases(self) -> None:
+        if not self.plugin_manager:
+            return
+        command_info = getattr(self.plugin_manager, 'command_handlers', {}).get('mc_message')
+        if not command_info:
+            return
+        names = self._qq_command_names()
+        command_info['names'] = names
+        command_info['normalized_names'] = {str(name).lower() for name in names}
 
     def _config_for_server(self, target_server: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """读取目标服务器独立插件配置，找不到则回退插件根配置。"""
@@ -585,21 +646,22 @@ class MCQQSyncPlugin(BotPlugin):
         return list((active_config.get('features') or {}).get(feature_key, {}).get('group_ids') or [])
 
     async def _send_message_to_mc(self, message: str, rcon_client=None,
-                                  target_server: Optional[Dict[str, Any]] = None):
+                                  target_server: Optional[Dict[str, Any]] = None) -> bool:
         """发送消息到MC服务器"""
         try:
             self.logger.debug(f"_send_message_to_mc 被调用，消息: {message}")
             
             if not self.plugin_manager:
                 self.logger.error("plugin_manager 为 None")
-                return
+                return False
             
             if not self.plugin_manager.qq_server:
                 self.logger.error("qq_server 为 None")
-                return
+                return False
             
             cmd = f"say {message}"
             rcon = rcon_client
+            explicit_target = bool(target_server)
             if rcon:
                 if hasattr(rcon, 'run_connected'):
                     connected, _ = await asyncio.to_thread(
@@ -608,38 +670,45 @@ class MCQQSyncPlugin(BotPlugin):
                     )
                     if not connected:
                         self.logger.warning("目标RCON连接未建立")
-                    return
+                        return False
+                    return True
 
                 if not await asyncio.to_thread(rcon.is_connected):
                     self.logger.warning("目标RCON连接未建立")
-                    return
+                    return False
 
                 self.logger.debug(f"执行目标RCON命令: {cmd}")
                 await asyncio.to_thread(rcon.execute_command, cmd)
                 self.logger.info(f"已通过目标RCON发送消息到MC: {message}")
-                return
+                return True
 
             executor = getattr(self.plugin_manager.qq_server, '_execute_server_command', None)
             if callable(executor):
                 await executor(cmd, target_server or self._active_target_server())
                 self.logger.info(f"已通过目标服务器执行器发送消息到MC: {message}")
-                return
+                return True
+
+            if explicit_target:
+                self.logger.warning("目标服务器缺少按服执行器，拒绝回退到全局RCON")
+                return False
 
             rcon = getattr(self.plugin_manager.qq_server, 'rcon_client', None)
             if not rcon:
                 self.logger.error("rcon_client 为 None")
-                return
+                return False
 
             if not await asyncio.to_thread(rcon.is_connected):
                 self.logger.warning("RCON连接未建立")
-                return
+                return False
 
             self.logger.debug(f"执行RCON命令: {cmd}")
             await asyncio.to_thread(rcon.execute_command, cmd)
             self.logger.info(f"已通过RCON发送消息到MC: {message}")
+            return True
             
         except Exception as e:
             self.logger.error(f"发送消息到MC失败: {e}", exc_info=True)
+            return False
     
     async def handle_sync_config_command(self, user_id: int, group_id: int,
                                         command_text: str, **kwargs) -> Optional[str]:
@@ -781,16 +850,18 @@ class MCQQSyncPlugin(BotPlugin):
         response += "MC玩家主动发送消息到QQ:\n"
         response += f"  状态: {'已启用' if active_config['features']['mc_manual_sync_to_qq']['enabled'] else '已禁用'}\n"
         response += f"  群列表: {', '.join(map(str, active_config['features']['mc_manual_sync_to_qq']['group_ids'])) if active_config['features']['mc_manual_sync_to_qq']['group_ids'] else '无'}\n"
-        response += f"  说明: 使用 qq <消息> 命令发送消息到QQ群\n\n"
+        mc_to_qq_prefix = active_config['mc_commands']['qq_command_prefix']
+        qq_to_mc_prefix = active_config['qq_commands']['mc_command_prefix']
+        response += f"  说明: 使用 {mc_to_qq_prefix} <消息> 命令发送消息到QQ群\n\n"
         
         response += "QQ用户通过命令发送消息到MC:\n"
         response += f"  状态: {'已启用' if active_config['features']['qq_manual_to_mc']['enabled'] else '已禁用'}\n"
         response += f"  群列表: {', '.join(map(str, active_config['features']['qq_manual_to_mc']['group_ids'])) if active_config['features']['qq_manual_to_mc']['group_ids'] else '无'}\n"
-        response += f"  说明: 使用 mc <消息> 命令发送消息到MC服务器\n\n"
+        response += f"  说明: 使用 {qq_to_mc_prefix} <消息> 命令发送消息到MC服务器\n\n"
         
         response += "命令前缀:\n"
-        response += f"  MC->QQ: {active_config['mc_commands']['qq_command_prefix']}\n"
-        response += f"  QQ->MC: {active_config['qq_commands']['mc_command_prefix']}\n\n"
+        response += f"  MC->QQ: {mc_to_qq_prefix}\n"
+        response += f"  QQ->MC: {qq_to_mc_prefix}\n\n"
         
         response += "黑名单:\n"
         response += f"  玩家: {', '.join(active_config['blacklist']['players']) if active_config['blacklist']['players'] else '无'}\n"
@@ -800,6 +871,9 @@ class MCQQSyncPlugin(BotPlugin):
     
     def get_plugin_help(self) -> str:
         """获取插件帮助"""
+        active_config = self._config_for_server()
+        mc_to_qq_prefix = active_config['mc_commands']['qq_command_prefix']
+        qq_to_mc_prefix = active_config['qq_commands']['mc_command_prefix']
         return f"""
 【MC-QQ消息同步】v{self.version}
 作者: {self.author}
@@ -811,15 +885,15 @@ class MCQQSyncPlugin(BotPlugin):
 • QQ群消息主动发送到MC服务器
 
 MC游戏内命令:
-  • {self.config['mc_commands']['qq_command_prefix']} <消息>
+  • {mc_to_qq_prefix} <消息>
     功能: 主动发送消息到QQ群 (功能2)
-    示例: qq 大家好
+    示例: {mc_to_qq_prefix} 大家好
 
 QQ群内命令:
-  • {self.config['qq_commands']['mc_command_prefix']} <消息>
+  • {qq_to_mc_prefix} <消息>
     功能: 通过命令发送消息到MC服务器 (功能3)
     说明: 需在QQ-MC绑定插件中绑定游戏ID
-    示例: mc 你好
+    示例: {qq_to_mc_prefix} 你好
 
 管理员命令 (QQ群内):
   • sync_config show

@@ -494,12 +494,23 @@ class PlayerCoordinatesPlugin(BotPlugin):
                 )
             
             # 尝试踢出玩家
-            kick_success = await self._kick_player(player_name, rcon_client)
+            kick_success = await self._kick_player(
+                player_name,
+                kwargs.get('target_rcon_client') or rcon_client,
+                kwargs.get('target_server')
+            )
             
             if kick_success:
                 self.logger.info(f"已踢出玩家: {player_name}")
             else:
                 self.logger.warning(f"无法踢出玩家或玩家未在线: {player_name}")
+                return (
+                    f"已中止修改玩家坐标!\n"
+                    f"{'─' * 10}\n"
+                    f"玩家: {player_name}\n"
+                    "原因: 无法确认玩家已离线或无法连接目标服务器执行 kick\n"
+                    "为避免在线玩家数据被覆盖，请确认 RCON/MSMP 可用后重试。"
+                )
             
             # 修改坐标和维度
             success = modifier.set_player_pos(player_name, x, y, z, dimension)
@@ -538,7 +549,7 @@ class PlayerCoordinatesPlugin(BotPlugin):
             self.logger.error(f"处理 setpos 命令失败: {e}")
             return f"命令执行失败: {e}"
     
-    async def _kick_player(self, player_name: str, rcon_client=None) -> bool:
+    async def _kick_player(self, player_name: str, rcon_client=None, target_server=None) -> bool:
         """尝试踢出玩家
         
         Args:
@@ -549,13 +560,20 @@ class PlayerCoordinatesPlugin(BotPlugin):
             bool: 踢出是否成功
         """
         try:
+            kick_command = f"kick {player_name} 坐标已修改，请重新登录"
+
             # 检查 RCON 客户端是否可用
             if not rcon_client:
+                qq_server = getattr(self.plugin_manager, 'qq_server', None) if self.plugin_manager else None
+                executor = getattr(qq_server, '_execute_server_command', None)
+                if callable(executor):
+                    result = await executor(kick_command, target_server or {})
+                    self.logger.debug(f"通过目标服务器执行器踢出玩家结果: {result}")
+                    return result is not None
                 self.logger.debug("RCON 客户端不可用，跳过踢出玩家步骤")
                 return False
 
             # 执行踢出命令
-            kick_command = f"kick {player_name} 坐标已修改，请重新登录"
             if hasattr(rcon_client, "run_connected"):
                 connected, result = await asyncio.to_thread(
                     rcon_client.run_connected,

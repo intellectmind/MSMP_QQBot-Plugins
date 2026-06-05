@@ -19,8 +19,9 @@ class QQMCBindingPlugin(BotPlugin):
         'max_bindings_per_qq': 1,
         'verify_timeout': 300,
         'verify_code_length': 6,
-        'chat_message_pattern': r'.*\[Not Secure\]\s*<([^>]+)>\s*(.+)'
+        'chat_message_pattern': r'.*(?:\[Not Secure\]\s*)?<([^>]+)>\s*(.+)'
     }
+    FLEXIBLE_CHAT_MESSAGE_PATTERN = r'.*(?:\[Not Secure\]\s*)?<([^>]+)>\s*(.+)'
     
     def __init__(self, logger):
         super().__init__(logger)
@@ -47,6 +48,8 @@ class QQMCBindingPlugin(BotPlugin):
         self._log_check_task = None
         self._running = False
         self._server_running = False
+        self._processed_log_timestamps = set()
+        self._seeded_log_sources = set()
     
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件，如果不存在则创建默认配置"""
@@ -131,9 +134,6 @@ class QQMCBindingPlugin(BotPlugin):
                 usage="绑定管理 list - 查看所有绑定\n绑定管理 delete <qq_id> <game_id> - 删除绑定",
                 admin_only=True
             )
-            
-            # 已处理的日志时间戳缓存（避免重复处理）
-            self._processed_log_timestamps = set()
             
             # 检查服务器是否已经在运行状态
             self._check_server_status()
@@ -239,8 +239,14 @@ class QQMCBindingPlugin(BotPlugin):
             if not self.plugin_manager:
                 return
                 
-            # 获取服务器日志
-            logs = self.plugin_manager.get_server_logs(50, target_server)
+            if hasattr(self.plugin_manager, 'get_incremental_server_logs'):
+                logs = self.plugin_manager.get_incremental_server_logs(
+                    "qq_mc_binding",
+                    1000,
+                    target_server
+                )
+            else:
+                logs = self.plugin_manager.get_server_logs(200, target_server)
             
             # 确保 logs 是列表
             if not isinstance(logs, list):
@@ -249,6 +255,14 @@ class QQMCBindingPlugin(BotPlugin):
             # 如果日志为空，直接返回
             if not logs:
                 return
+
+            server_key = self._server_key(target_server)
+            if self._should_seed_log_source(target_server, server_key):
+                for log_line in logs:
+                    if isinstance(log_line, str):
+                        self._processed_log_timestamps.add(self._get_log_hash(f"{server_key}::{log_line}"))
+                self._seeded_log_sources.add(server_key)
+                return
             
             # 处理新的日志行（从后往前处理，只处理最新的）
             new_logs_processed = 0
@@ -256,7 +270,7 @@ class QQMCBindingPlugin(BotPlugin):
                 log_line = logs[i]
                 if isinstance(log_line, str):
                     # 生成日志的唯一标识（使用时间戳）
-                    log_hash = self._get_log_hash(f"{self._server_key(target_server)}::{log_line}")
+                    log_hash = self._get_log_hash(f"{server_key}::{log_line}")
                     
                     # 如果已经处理过，跳过
                     if log_hash in self._processed_log_timestamps:
@@ -304,8 +318,8 @@ class QQMCBindingPlugin(BotPlugin):
     def _cleanup_processed_logs_cache(self):
         """清理已处理日志缓存，避免内存无限增长"""
         try:
-            # 如果缓存太大，清理一部分（保留最近200条）
-            if len(self._processed_log_timestamps) > 200:
+            # 多服务器 latest.log 基线会占用较多 hash，缓存过小会导致旧日志重复处理。
+            if len(self._processed_log_timestamps) > 5000:
                 # 转换为列表，删除前一半
                 timestamps_list = list(self._processed_log_timestamps)
                 remove_count = len(timestamps_list) // 2
@@ -316,20 +330,31 @@ class QQMCBindingPlugin(BotPlugin):
         except Exception as e:
             self.logger.error(f"清理日志缓存失败: {e}")
 
+    def _should_seed_log_source(self, target_server: Optional[Dict[str, Any]], server_key: str) -> bool:
+        if server_key in self._seeded_log_sources:
+            return False
+        if not self.plugin_manager or not hasattr(self.plugin_manager, 'is_server_running'):
+            return False
+        try:
+            return not self.plugin_manager.is_server_running(target_server)
+        except Exception:
+            return False
+
     async def _process_log_line(self, log_line: str, target_server: Optional[Dict[str, Any]] = None) -> bool:
         """处理单条日志行，返回是否处理了消息"""
         try:
             import re
             
-            # 首先检查日志行是否包含聊天消息的关键特征
-            if '[Not Secure]' not in log_line:
-                return False
-                
             if '<' not in log_line or '>' not in log_line:
                 return False
                 
-            pattern = self.config['chat_message_pattern']
-            match = re.search(pattern, log_line)
+            active_config = self._config_for_server(target_server)
+            pattern = active_config.get('chat_message_pattern') or self.config['chat_message_pattern']
+            match = None
+            for candidate in dict.fromkeys([pattern, self.FLEXIBLE_CHAT_MESSAGE_PATTERN]):
+                match = re.search(candidate, log_line)
+                if match:
+                    break
             
             if not match:
                 return False
@@ -500,8 +525,7 @@ class QQMCBindingPlugin(BotPlugin):
         loaded_data: Dict[str, List[Dict[str, Any]]] = {}
         try:
             server_files = self._server_binding_files()
-            has_server_data = any(path.exists() for path in server_files.values())
-            if self.data_file.exists() and not has_server_data:
+            if self.data_file.exists():
                 with open(self.data_file, 'r', encoding='utf-8') as f:
                     loaded_data = self._merge_binding_data(loaded_data, json.load(f))
                 self.logger.info(f"已读取旧绑定数据文件: {self.data_file}")
@@ -644,6 +668,7 @@ class QQMCBindingPlugin(BotPlugin):
 
     def _resolve_verify_key(self, verify_code: str, target_server: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """按服务器优先解析验证码，避免多服务器相同验证码串服。"""
+        explicit_target = bool(target_server)
         preferred_key = self._server_key(target_server or self._active_target_server())
         preferred = self._verify_storage_key(preferred_key, verify_code)
         preferred_info = self.pending_verify.get(preferred)
@@ -653,6 +678,9 @@ class QQMCBindingPlugin(BotPlugin):
             and time.time() <= preferred_info.get('expire_time', 0)
         ):
             return preferred
+
+        if explicit_target:
+            return None
 
         matches = [
             key for key, info in self.pending_verify.items()
@@ -700,9 +728,13 @@ class QQMCBindingPlugin(BotPlugin):
         qq_server = getattr(self.plugin_manager, 'qq_server', None) if self.plugin_manager else None
         if not qq_server:
             return None
+        explicit_target = bool(target_server)
         executor = getattr(qq_server, '_execute_server_command', None)
         if callable(executor):
             return await executor(command, target_server or self._active_target_server())
+        if explicit_target:
+            self.logger.warning("目标服务器缺少按服执行器，拒绝回退到全局RCON")
+            return None
         rcon = getattr(qq_server, 'rcon_client', None)
         if rcon and hasattr(rcon, "run_connected"):
             connected, result = await asyncio.to_thread(

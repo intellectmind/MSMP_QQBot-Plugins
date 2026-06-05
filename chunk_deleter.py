@@ -1,5 +1,7 @@
 import asyncio
 import contextvars
+import copy
+import json
 import os
 import shutil
 import re
@@ -176,6 +178,7 @@ class ChunkDeleterPlugin(BotPlugin):
         """处理单个区块删除命令"""
         try:
             target_server = kwargs.get("target_server")
+            active_config = self._config_for_server(target_server)
             # 检查服务器目录
             if not await self._ensure_server_detected(config_manager, target_server):
                 return "请先配置服务器工作目录"
@@ -202,10 +205,12 @@ class ChunkDeleterPlugin(BotPlugin):
                 dimension = "overworld"
                 if len(parts) > 2:
                     # 检查第三个参数是否是维度
-                    if parts[2].lower() in self.config["allowed_dimensions"]:
+                    if parts[2].lower() in active_config["allowed_dimensions"]:
                         dimension = parts[2].lower()
                     elif parts[2].lower() in ["world", "block", "coord"]:
                         coord_type = "world"
+                    else:
+                        return f"错误: 不支持的维度 '{parts[2]}'，支持的维度: {', '.join(active_config['allowed_dimensions'])}"
                 
                 # 如果还有第四个参数，检查是否是坐标类型
                 if len(parts) > 3 and parts[3].lower() in ["world", "block", "coord"]:
@@ -215,8 +220,8 @@ class ChunkDeleterPlugin(BotPlugin):
                 return f"错误: {str(e)}"
             
             # 验证维度
-            if dimension not in self.config["allowed_dimensions"]:
-                return f"错误: 不支持的维度 '{dimension}'，支持的维度: {', '.join(self.config['allowed_dimensions'])}"
+            if dimension not in active_config["allowed_dimensions"]:
+                return f"错误: 不支持的维度 '{dimension}'，支持的维度: {', '.join(active_config['allowed_dimensions'])}"
             
             # 检查世界文件夹是否存在
             world_path = self._get_world_path(dimension)
@@ -232,11 +237,13 @@ class ChunkDeleterPlugin(BotPlugin):
                 return f"错误: 区块文件和POI文件都不存在 - {dimension} {coord_display}"
             
             # 如果需要确认
-            if self.config["require_confirmation"]:
-                return await self._request_single_confirmation(user_id, group_id, x, z, dimension, coord_type, target_server)
+            if active_config["require_confirmation"]:
+                return await self._request_single_confirmation(
+                    user_id, group_id, x, z, dimension, coord_type, target_server, active_config
+                )
             
             # 直接执行删除
-            return await self._execute_chunk_deletion(user_id, x, z, dimension, "single", coord_type)
+            return await self._execute_chunk_deletion(user_id, x, z, dimension, "single", coord_type, active_config)
             
         except Exception as e:
             self.logger.error(f"处理区块删除命令失败: {e}", exc_info=True)
@@ -247,6 +254,7 @@ class ChunkDeleterPlugin(BotPlugin):
         """处理区域区块删除命令"""
         try:
             target_server = kwargs.get("target_server")
+            active_config = self._config_for_server(target_server)
             # 检查服务器目录
             if not await self._ensure_server_detected(config_manager, target_server):
                 return "请先配置服务器工作目录"
@@ -268,10 +276,12 @@ class ChunkDeleterPlugin(BotPlugin):
                 # 解析维度
                 dimension = "overworld"
                 if len(parts) > 4:
-                    if parts[4].lower() in self.config["allowed_dimensions"]:
+                    if parts[4].lower() in active_config["allowed_dimensions"]:
                         dimension = parts[4].lower()
                     elif parts[4].lower() in ["world", "block", "coord"]:
                         coord_type = "world"
+                    else:
+                        return f"错误: 不支持的维度 '{parts[4]}'，支持的维度: {', '.join(active_config['allowed_dimensions'])}"
                 
                 # 如果还有第六个参数，检查是否是坐标类型
                 if len(parts) > 5 and parts[5].lower() in ["world", "block", "coord"]:
@@ -281,7 +291,7 @@ class ChunkDeleterPlugin(BotPlugin):
                 return f"错误: {str(e)}"
             
             # 验证维度
-            if dimension not in self.config["allowed_dimensions"]:
+            if dimension not in active_config["allowed_dimensions"]:
                 return f"错误: 不支持的维度 '{dimension}'"
             
             # 检查世界文件夹是否存在
@@ -311,11 +321,15 @@ class ChunkDeleterPlugin(BotPlugin):
                 return f"错误: 指定区域内没有找到任何区块文件或POI文件 ({coord_type_display})"
             
             # 如果需要确认
-            if self.config["require_confirmation"]:
-                return await self._request_area_confirmation(user_id, group_id, x1, z1, x2, z2, dimension, chunk_count, coord_type, target_server)
+            if active_config["require_confirmation"]:
+                return await self._request_area_confirmation(
+                    user_id, group_id, x1, z1, x2, z2, dimension, chunk_count, coord_type, target_server, active_config
+                )
             
             # 直接执行删除
-            return await self._execute_area_deletion(user_id, x1, z1, x2, z2, dimension, chunk_count, coord_type)
+            return await self._execute_area_deletion(
+                user_id, x1, z1, x2, z2, dimension, chunk_count, coord_type, active_config
+            )
             
         except Exception as e:
             self.logger.error(f"处理区域删除命令失败: {e}", exc_info=True)
@@ -326,6 +340,7 @@ class ChunkDeleterPlugin(BotPlugin):
         """处理还原区块命令"""
         try:
             target_server = kwargs.get("target_server")
+            active_config = self._config_for_server(target_server)
             # 检查服务器目录
             if not await self._ensure_server_detected(config_manager, target_server):
                 return "请先配置服务器工作目录"
@@ -346,10 +361,12 @@ class ChunkDeleterPlugin(BotPlugin):
                 # 解析维度
                 dimension = "overworld"
                 if len(parts) > 2:
-                    if parts[2].lower() in self.config["allowed_dimensions"]:
+                    if parts[2].lower() in active_config["allowed_dimensions"]:
                         dimension = parts[2].lower()
                     elif parts[2].lower() in ["world", "block", "coord"]:
                         coord_type = "world"
+                    else:
+                        return f"错误: 不支持的维度 '{parts[2]}'，支持的维度: {', '.join(active_config['allowed_dimensions'])}"
                 
                 # 如果还有第四个参数，检查是否是坐标类型
                 if len(parts) > 3 and parts[3].lower() in ["world", "block", "coord"]:
@@ -369,6 +386,7 @@ class ChunkDeleterPlugin(BotPlugin):
         """处理手动备份区块命令"""
         try:
             target_server = kwargs.get("target_server")
+            active_config = self._config_for_server(target_server)
             # 检查服务器目录
             if not await self._ensure_server_detected(config_manager, target_server):
                 return "请先配置服务器工作目录"
@@ -389,10 +407,12 @@ class ChunkDeleterPlugin(BotPlugin):
                 # 解析维度
                 dimension = "overworld"
                 if len(parts) > 2:
-                    if parts[2].lower() in self.config["allowed_dimensions"]:
+                    if parts[2].lower() in active_config["allowed_dimensions"]:
                         dimension = parts[2].lower()
                     elif parts[2].lower() in ["world", "block", "coord"]:
                         coord_type = "world"
+                    else:
+                        return f"错误: 不支持的维度 '{parts[2]}'，支持的维度: {', '.join(active_config['allowed_dimensions'])}"
                 
                 # 如果还有第四个参数，检查是否是坐标类型
                 if len(parts) > 3 and parts[3].lower() in ["world", "block", "coord"]:
@@ -408,9 +428,11 @@ class ChunkDeleterPlugin(BotPlugin):
             return f"命令执行失败: {str(e)}"
     
     async def _request_single_confirmation(self, user_id: int, group_id: int, x: int, z: int,
-                                           dimension: str, coord_type: str, target_server=None) -> str:
+                                           dimension: str, coord_type: str, target_server=None,
+                                           config: Optional[Dict] = None) -> str:
         """请求单个区块删除确认"""
-        timeout = self.config["confirmation_timeout"]
+        active_config = config or self._config_for_server(target_server)
+        timeout = active_config["confirmation_timeout"]
         coord_display = f"世界坐标({x*16}, {z*16})" if coord_type == "world" else f"区块坐标({x}, {z})"
         server_key = self._server_key(target_server)
         confirmation_key = self._confirmation_key(user_id, group_id, server_key)
@@ -437,6 +459,7 @@ class ChunkDeleterPlugin(BotPlugin):
             "coordinates": (x, z),
             "dimension": dimension,
             "coord_type": coord_type,
+            "config": copy.deepcopy(active_config),
             "type": "single",
             "chunk_count": 1,
             "timestamp": asyncio.get_event_loop().time()
@@ -448,9 +471,11 @@ class ChunkDeleterPlugin(BotPlugin):
         return confirm_msg
     
     async def _request_area_confirmation(self, user_id: int, group_id: int, x1: int, z1: int, x2: int, z2: int,
-                                         dimension: str, chunk_count: int, coord_type: str, target_server=None) -> str:
+                                         dimension: str, chunk_count: int, coord_type: str, target_server=None,
+                                         config: Optional[Dict] = None) -> str:
         """请求区域区块删除确认"""
-        timeout = self.config["confirmation_timeout"]
+        active_config = config or self._config_for_server(target_server)
+        timeout = active_config["confirmation_timeout"]
         coord_display1 = f"世界坐标({x1*16}, {z1*16})" if coord_type == "world" else f"区块坐标({x1}, {z1})"
         coord_display2 = f"世界坐标({x2*16}, {z2*16})" if coord_type == "world" else f"区块坐标({x2}, {z2})"
         server_key = self._server_key(target_server)
@@ -479,6 +504,7 @@ class ChunkDeleterPlugin(BotPlugin):
             "coordinates": (x1, z1, x2, z2),
             "dimension": dimension,
             "coord_type": coord_type,
+            "config": copy.deepcopy(active_config),
             "type": "area",
             "chunk_count": chunk_count,
             "timestamp": asyncio.get_event_loop().time()
@@ -538,14 +564,14 @@ class ChunkDeleterPlugin(BotPlugin):
                 x, z = operation["coordinates"]
                 coord_type = operation.get("coord_type", "chunk")
                 return await self._execute_chunk_deletion(
-                    user_id, x, z, operation["dimension"], "single", coord_type
+                    user_id, x, z, operation["dimension"], "single", coord_type, operation.get("config")
                 )
             else:
                 x1, z1, x2, z2 = operation["coordinates"]
                 coord_type = operation.get("coord_type", "chunk")
                 return await self._execute_area_deletion(
                     user_id, x1, z1, x2, z2, operation["dimension"], 
-                    operation["chunk_count"], coord_type
+                    operation["chunk_count"], coord_type, operation.get("config")
                 )
                 
         except Exception as e:
@@ -553,9 +579,11 @@ class ChunkDeleterPlugin(BotPlugin):
             return f"确认操作失败: {str(e)}"
     
     async def _execute_chunk_deletion(self, user_id: int, x: int, z: int, 
-                                    dimension: str, operation_type: str, coord_type: str = "chunk") -> str:
+                                    dimension: str, operation_type: str, coord_type: str = "chunk",
+                                    config: Optional[Dict] = None) -> str:
         """执行单个区块文件和POI文件删除"""
         try:
+            active_config = config or self._config_for_server()
             # 记录操作开始
             coord_display = f"世界坐标({x*16}, {z*16})" if coord_type == "world" else f"区块坐标({x}, {z})"
             operation_record = {
@@ -590,7 +618,7 @@ class ChunkDeleterPlugin(BotPlugin):
             # 备份文件（如果启用）
             chunk_backup_path = None
             poi_backup_path = None
-            if self.config["backup_before_delete"]:
+            if active_config["backup_before_delete"]:
                 if chunk_exists:
                     chunk_backup_path = await self._backup_chunk_file(chunk_file, dimension, x, z, "chunk")
                 if poi_exists:
@@ -674,9 +702,11 @@ class ChunkDeleterPlugin(BotPlugin):
             return f"删除区块失败: {str(e)}"
     
     async def _execute_area_deletion(self, user_id: int, x1: int, z1: int, 
-                                   x2: int, z2: int, dimension: str, chunk_count: int, coord_type: str = "chunk") -> str:
+                                   x2: int, z2: int, dimension: str, chunk_count: int, coord_type: str = "chunk",
+                                   config: Optional[Dict] = None) -> str:
         """执行区域区块文件和POI文件删除"""
         try:
+            active_config = config or self._config_for_server()
             # 记录操作开始
             coord_display = f"世界坐标({x1*16},{z1*16})-({x2*16},{z2*16})" if coord_type == "world" else f"区块坐标({x1},{z1})-({x2},{z2})"
             operation_record = {
@@ -714,7 +744,7 @@ class ChunkDeleterPlugin(BotPlugin):
                     poi_file = self._get_poi_file_path(world_path, x, z)
                     
                     # 备份文件（如果启用）
-                    if self.config["backup_before_delete"]:
+                    if active_config["backup_before_delete"]:
                         if os.path.exists(chunk_file):
                             await self._backup_chunk_file(chunk_file, dimension, x, z, "chunk")
                             backup_chunk_count += 1
@@ -952,6 +982,25 @@ class ChunkDeleterPlugin(BotPlugin):
         target_server = target_server or {}
         return str(target_server.get("_config_file") or target_server.get("name") or "default")
 
+    def _config_for_server(self, target_server=None) -> Dict:
+        """读取目标服务器独立配置，找不到则使用插件根配置。"""
+        config = copy.deepcopy(self.DEFAULT_CONFIG)
+        config.update(copy.deepcopy(self.config or {}))
+        plugin_manager = getattr(self, "plugin_manager", None)
+        if plugin_manager and hasattr(plugin_manager, "get_plugin_server_file"):
+            path = plugin_manager.get_plugin_server_file(
+                "chunk_deleter", "config.json", target_server or {}, create_parent=False
+            )
+            try:
+                if path.exists():
+                    with open(path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        config.update(loaded)
+            except Exception as e:
+                self.logger.error(f"读取服务器区块删除配置失败 {path}: {e}")
+        return config
+
     def _confirmation_key(self, user_id: int, group_id: int, server_key: str) -> str:
         return f"{server_key}::{group_id}::{user_id}"
 
@@ -1087,6 +1136,7 @@ class ChunkDeleterPlugin(BotPlugin):
     
     def get_plugin_help(self) -> str:
         """返回插件帮助信息"""
+        active_config = self._config_for_server()
         return f"""
 {self.name} v{self.version}
 作者: {self.author}
@@ -1106,10 +1156,10 @@ class ChunkDeleterPlugin(BotPlugin):
 • chunk - 区块坐标 (默认)
 • world - 世界坐标 (会自动转换为区块坐标)
 
-支持维度: {', '.join(self.config['allowed_dimensions'])}
-安全特性: 备份功能 {'已启用' if self.config['backup_before_delete'] else '已禁用'}
-需要确认: {'是' if self.config['require_confirmation'] else '否'}
-确认超时: {self.config['confirmation_timeout']} 秒
+支持维度: {', '.join(active_config['allowed_dimensions'])}
+安全特性: 备份功能 {'已启用' if active_config['backup_before_delete'] else '已禁用'}
+需要确认: {'是' if active_config['require_confirmation'] else '否'}
+确认超时: {active_config['confirmation_timeout']} 秒
 
 示例:
 • delete_chunk 10 20 overworld - 删除主世界区块坐标(10,20)
